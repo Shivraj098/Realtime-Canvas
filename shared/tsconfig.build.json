@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts", "dist"]
+}
+// this is to typecheck the build output, not to compile the source code.
