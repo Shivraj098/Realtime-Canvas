@@ -15,12 +15,12 @@ what it missed, not the entire room state.
 ## Architecture
 
 \`\`\`
-shared/   - protocol types, Hybrid Logical Clock, CRDT-lite reconciliation
-            (imported identically by both client and server - single
-            source of truth for "how conflicts resolve")
-server/   - WebSocket server, room/presence management, SQLite-backed
-            append-only op log
-client/   - Vite + TypeScript canvas UI
+shared/ - protocol types, Hybrid Logical Clock, CRDT-lite reconciliation
+(imported identically by both client and server - single
+source of truth for "how conflicts resolve")
+server/ - WebSocket server, room/presence management, SQLite-backed
+append-only op log
+client/ - Vite + TypeScript canvas UI
 \`\`\`
 
 See [`shared/src/hlc.ts`](shared/src/hlc.ts) and
@@ -48,9 +48,9 @@ checkpoint.
 
 \`\`\`bash
 npm install
-npm run lint          # ESLint
-npm run format:check  # Prettier
-npm run typecheck     # TypeScript, all workspaces
-npm run test          # Vitest
-npm run build         # production build, all workspaces
+npm run lint # ESLint
+npm run format:check # Prettier
+npm run typecheck # TypeScript, all workspaces
+npm run test # Vitest
+npm run build # production build, all workspaces
 \`\`\`
