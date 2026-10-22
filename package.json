@@ -9,9 +9,9 @@
     "client"
   ],
   "scripts": {
-    "build": "npm run build -w shared",
-    "typecheck": "npm run typecheck -w shared",
-    "test": "npm run test -w shared",
+    "build": "npm run build -w shared && npm run build -w server",
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server",
+    "test": "npm run test -w shared && npm run test -w server",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

@@ -1,0 +1,133 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import type { Op } from "@realtime-canvas/shared";
+import { OpLog } from "./op-log";
+
+function makeOp(shapeId: string, physical = 100, opId = `op-${shapeId}`): Op {
+  return {
+    type: "create_shape",
+    shapeId,
+    roomId: "room1",
+    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000" },
+    hlc: { physical, logical: 0, nodeId: "server" },
+    opId,
+  };
+}
+
+describe("OpLog", () => {
+  it("assigns sequence numbers starting at 1, incrementing per room", () => {
+    const log = new OpLog(":memory:");
+    expect(log.append("room1", makeOp("s1"))).toEqual({ status: "appended", seq: 1 });
+    expect(log.append("room1", makeOp("s2"))).toEqual({ status: "appended", seq: 2 });
+    log.close();
+  });
+
+  it("keeps sequence numbers independent per room", () => {
+    const log = new OpLog(":memory:");
+    expect(log.append("room1", makeOp("s1"))).toEqual({ status: "appended", seq: 1 });
+    expect(log.append("room2", makeOp("s1"))).toEqual({ status: "appended", seq: 1 });
+    log.close();
+  });
+
+  it("latestSeq returns 0 for a room with no ops yet", () => {
+    const log = new OpLog(":memory:");
+    expect(log.latestSeq("empty-room")).toBe(0);
+    log.close();
+  });
+
+  it("latestSeq reflects the highest appended sequence number", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1"));
+    log.append("room1", makeOp("s2"));
+    expect(log.latestSeq("room1")).toBe(2);
+    log.close();
+  });
+
+  it("since() returns only ops after the given sequence, in order", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1"));
+    log.append("room1", makeOp("s2"));
+    log.append("room1", makeOp("s3"));
+
+    const missed = log.since("room1", 1);
+    expect(missed.map((row) => row.seq)).toEqual([2, 3]);
+    expect(missed.map((row) => (row.op as { shapeId: string }).shapeId)).toEqual(["s2", "s3"]);
+    log.close();
+  });
+
+  it("since() with sinceSeq 0 returns the full history - the fresh-join path", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1"));
+    log.append("room1", makeOp("s2"));
+    expect(log.since("room1", 0)).toHaveLength(2);
+    log.close();
+  });
+
+  it("since() for a room with no ops returns an empty array, not an error", () => {
+    const log = new OpLog(":memory:");
+    expect(log.since("nonexistent-room", 0)).toEqual([]);
+    log.close();
+  });
+
+  it("round-trips an op through the JSON column unchanged", () => {
+    const log = new OpLog(":memory:");
+    const original = makeOp("s1", 12345);
+    log.append("room1", original);
+    const [row] = log.since("room1", 0);
+    expect(row!.op).toEqual(original);
+    log.close();
+  });
+});
+
+describe("OpLog idempotency", () => {
+  it("reports a repeated opId in the same room as a duplicate and stores nothing", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1", 100, "same-op"));
+    expect(log.append("room1", makeOp("s1", 999, "same-op"))).toEqual({ status: "duplicate" });
+    expect(log.since("room1", 0)).toHaveLength(1);
+    log.close();
+  });
+
+  it("does not consume a sequence number for a duplicate", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1", 100, "same-op"));
+    log.append("room1", makeOp("s1", 100, "same-op"));
+    expect(log.append("room1", makeOp("s2"))).toEqual({ status: "appended", seq: 2 });
+    log.close();
+  });
+
+  it("allows the same opId in different rooms", () => {
+    const log = new OpLog(":memory:");
+    expect(log.append("room1", makeOp("s1", 100, "shared-id")).status).toBe("appended");
+    expect(log.append("room2", makeOp("s1", 100, "shared-id")).status).toBe("appended");
+    log.close();
+  });
+});
+
+describe("OpLog durability", () => {
+  let dir: string | undefined;
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("keeps ops, sequence numbers, and dedupe state across a close and reopen", () => {
+    dir = mkdtempSync(join(tmpdir(), "op-log-"));
+    const path = join(dir, "ops.sqlite");
+
+    const first = new OpLog(path);
+    first.append("room1", makeOp("s1"));
+    first.append("room1", makeOp("s2"));
+    first.close();
+
+    const reopened = new OpLog(path);
+    expect(reopened.latestSeq("room1")).toBe(2);
+    expect(reopened.since("room1", 0)).toHaveLength(2);
+    expect(reopened.append("room1", makeOp("s1"))).toEqual({ status: "duplicate" });
+    expect(reopened.append("room1", makeOp("s3"))).toEqual({ status: "appended", seq: 3 });
+    reopened.close();
+  });
+});

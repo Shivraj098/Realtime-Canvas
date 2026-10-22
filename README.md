@@ -36,7 +36,7 @@ checkpoint.
 - [x] **Phase 1 — Foundation**: monorepo tooling (ESLint, Prettier,
       Vitest, CI), Hybrid Logical Clock, wire protocol, per-field LWW
       reconciliation — all test-covered
-- [ ] **Phase 2 — Server**: WebSocket server, room management, SQLite op
+- [x] **Phase 2 — Server**: WebSocket server, room management, SQLite op
       log, reconnect/replay
 - [ ] **Phase 3 — Client core**: connection handling, local state store
 - [ ] **Phase 4 — Client canvas**: shape rendering, drag/create/delete,
