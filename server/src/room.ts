@@ -1,5 +1,5 @@
 import type { WebSocket } from "ws";
-import { applyOp, type Op, type RoomState } from "@realtime-canvas/shared";
+import { applyOp, getShape, isDeleted, type Op, type RoomState } from "@realtime-canvas/shared";
 
 const PRESENCE_COLORS = ["#7fd8b0", "#d98e3d", "#7aa6d9", "#c97fd8", "#d97f7f"];
 
@@ -35,8 +35,20 @@ export class Room {
     }
   }
 
+  /** Every shape ever created in the room, including deleted ones (tombstones). */
   get state(): RoomState {
     return this.currentState;
+  }
+
+  /** Whether the shape was ever created here - deleted shapes count, since ids are never reused. */
+  hasShape(shapeId: string): boolean {
+    return getShape(this.currentState, shapeId) !== undefined;
+  }
+
+  /** Whether the shape exists and has not been deleted. */
+  isLive(shapeId: string): boolean {
+    const shape = getShape(this.currentState, shapeId);
+    return shape !== undefined && !isDeleted(shape);
   }
 
   addClient(clientId: string, socket: WebSocket): Client {

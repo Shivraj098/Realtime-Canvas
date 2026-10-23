@@ -1,7 +1,10 @@
 import Database from "better-sqlite3";
 import type { Op } from "@realtime-canvas/shared";
 
-export type AppendResult = { status: "appended"; seq: number } | { status: "duplicate" };
+export type StoredOp = { seq: number; op: Op };
+
+/** `duplicate` carries the op as originally stored, so a retry can be answered with its real sequence number. */
+export type AppendResult = { status: "appended"; seq: number } | ({ status: "duplicate" } & StoredOp);
 
 /**
  * Append-only operation log, persisted to SQLite. This is what lets a
@@ -19,12 +22,13 @@ export type AppendResult = { status: "appended"; seq: number } | { status: "dupl
  * saw acknowledged must not apply it twice. A replayed update would
  * otherwise get a fresh, later server timestamp and could silently
  * overwrite a newer edit from someone else. The UNIQUE (room_id, op_id)
- * constraint makes the retry a no-op.
+ * constraint makes the retry a no-op, and the stored row lets the server
+ * tell the retrying client which sequence number its op already has.
  */
 export class OpLog {
   private readonly db: Database.Database;
   private readonly insertStmt: Database.Statement;
-  private readonly findOpIdStmt: Database.Statement;
+  private readonly findByOpIdStmt: Database.Statement;
   private readonly selectSinceStmt: Database.Statement;
   private readonly maxSeqStmt: Database.Statement;
   private readonly appendTx: (roomId: string, op: Op) => AppendResult;
@@ -46,7 +50,9 @@ export class OpLog {
     this.insertStmt = this.db.prepare(
       `INSERT INTO ops (room_id, seq, op_id, op_json) VALUES (@roomId, @seq, @opId, @opJson)`,
     );
-    this.findOpIdStmt = this.db.prepare(`SELECT 1 FROM ops WHERE room_id = @roomId AND op_id = @opId`);
+    this.findByOpIdStmt = this.db.prepare(
+      `SELECT seq, op_json FROM ops WHERE room_id = @roomId AND op_id = @opId`,
+    );
     this.selectSinceStmt = this.db.prepare(
       `SELECT seq, op_json FROM ops WHERE room_id = @roomId AND seq > @sinceSeq ORDER BY seq ASC`,
     );
@@ -55,8 +61,9 @@ export class OpLog {
     // Check-for-duplicate, read the next seq, and insert as one atomic
     // unit, so the sequence can never be handed out twice.
     this.appendTx = this.db.transaction((roomId: string, op: Op): AppendResult => {
-      if (this.findOpIdStmt.get({ roomId, opId: op.opId })) {
-        return { status: "duplicate" };
+      const existing = this.find(roomId, op.opId);
+      if (existing) {
+        return { status: "duplicate", ...existing };
       }
       const seq = this.latestSeq(roomId) + 1;
       this.insertStmt.run({ roomId, seq, opId: op.opId, opJson: JSON.stringify(op) });
@@ -70,6 +77,12 @@ export class OpLog {
     return row.maxSeq ?? 0;
   }
 
+  /** The op already stored under this opId in the room, with its sequence number, or null. */
+  find(roomId: string, opId: string): StoredOp | null {
+    const row = this.findByOpIdStmt.get({ roomId, opId }) as { seq: number; op_json: string } | undefined;
+    return row ? { seq: row.seq, op: JSON.parse(row.op_json) as Op } : null;
+  }
+
   /**
    * Appends an op, assigning it the next sequence number for the room.
    * Returns `duplicate` (and stores nothing) if this opId was already
@@ -80,7 +93,7 @@ export class OpLog {
   }
 
   /** All ops after `sinceSeq`, in order - what a reconnecting client needs to catch up. */
-  since(roomId: string, sinceSeq: number): { seq: number; op: Op }[] {
+  since(roomId: string, sinceSeq: number): StoredOp[] {
     const rows = this.selectSinceStmt.all({ roomId, sinceSeq }) as { seq: number; op_json: string }[];
     return rows.map((row) => ({ seq: row.seq, op: JSON.parse(row.op_json) as Op }));
   }

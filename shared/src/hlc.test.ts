@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HybridLogicalClock, compareHlc } from "./hlc";
+import { HlcDriftError, HybridLogicalClock, compareHlc } from "./hlc";
 
 describe("HybridLogicalClock.tick", () => {
   it("advances physical time and resets logical when wall clock moves forward", () => {
@@ -113,5 +113,49 @@ describe("causality property under simulated message passing", () => {
     const respondedByB = nodeB.tick();
 
     expect(compareHlc(sentByA, respondedByB)).toBeLessThan(0);
+  });
+});
+
+describe("HybridLogicalClock.update drift limit", () => {
+  const remoteAt = (physical: number) => ({ physical, logical: 0, nodeId: "remote" });
+
+  it("throws HlcDriftError when the remote timestamp is further ahead than maxDriftMs", () => {
+    const clock = new HybridLogicalClock("local", () => 1000, { maxDriftMs: 500 });
+    expect(() => clock.update(remoteAt(1501))).toThrow(HlcDriftError);
+  });
+
+  it("reports how far ahead the remote was", () => {
+    const clock = new HybridLogicalClock("local", () => 1000, { maxDriftMs: 500 });
+    try {
+      clock.update(remoteAt(9000));
+      expect.unreachable("update should have thrown");
+    } catch (error) {
+      expect(error).toBeInstanceOf(HlcDriftError);
+      expect((error as HlcDriftError).driftMs).toBe(8000);
+      expect((error as HlcDriftError).maxDriftMs).toBe(500);
+    }
+  });
+
+  it("accepts a remote timestamp exactly at the limit", () => {
+    const clock = new HybridLogicalClock("local", () => 1000, { maxDriftMs: 500 });
+    expect(clock.update(remoteAt(1500)).physical).toBe(1500);
+  });
+
+  it("leaves the clock untouched when it refuses a timestamp", () => {
+    let now = 1000;
+    const clock = new HybridLogicalClock("local", () => now, { maxDriftMs: 500 });
+    expect(() => clock.update(remoteAt(9_000_000))).toThrow(HlcDriftError);
+    now = 1001;
+    expect(clock.tick().physical).toBe(1001); // not dragged to 9_000_000
+  });
+
+  it("has no limit by default (original behaviour)", () => {
+    const clock = new HybridLogicalClock("local", () => 1000);
+    expect(clock.update(remoteAt(9_000_000)).physical).toBe(9_000_000);
+  });
+
+  it("does not limit remote timestamps that are behind the local clock", () => {
+    const clock = new HybridLogicalClock("local", () => 100_000, { maxDriftMs: 10 });
+    expect(clock.update(remoteAt(1)).physical).toBe(100_000);
   });
 });

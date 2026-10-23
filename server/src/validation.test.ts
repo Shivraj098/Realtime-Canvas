@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseClientMessage } from "./validation";
+import { parseClientMessage, rejectableOpId } from "./validation";
 
 const hlc = { physical: 1000, logical: 0, nodeId: "client-1" };
 const fields = { x: 10, y: 20, width: 90, height: 90, color: "#7fd8b0" };
@@ -9,13 +9,24 @@ const validUpdate = {
   type: "update_shape",
   shapeId: "s1",
   roomId: "room1",
-  change: { field: "x", value: 5 },
+  changes: { x: 5 },
   hlc,
   opId: "op2",
 };
 const validDelete = { type: "delete_shape", shapeId: "s1", roomId: "room1", hlc, opId: "op3" };
 const validCursor = { type: "cursor", roomId: "room1", clientId: "c1", x: 1, y: 2, color: "#fff" };
-const validJoin = { type: "join_room", roomId: "room1", clientId: "c1", sinceSeq: 0 };
+const validDrag = {
+  type: "drag_preview",
+  roomId: "room1",
+  clientId: "c1",
+  shapeId: "s1",
+  changes: { x: 1, y: 2 },
+};
+const validJoin = { type: "join_room", protocolVersion: 1, roomId: "room1", clientId: "c1", sinceSeq: 0 };
+
+function omit(value: object, key: string): object {
+  return Object.fromEntries(Object.entries(value).filter(([entryKey]) => entryKey !== key));
+}
 
 describe("parseClientMessage: valid messages", () => {
   it.each([
@@ -23,6 +34,7 @@ describe("parseClientMessage: valid messages", () => {
     ["update_shape", validUpdate],
     ["delete_shape", validDelete],
     ["cursor", validCursor],
+    ["drag_preview", validDrag],
     ["join_room", validJoin],
   ])("accepts a well-formed %s", (_name, message) => {
     const result = parseClientMessage(message);
@@ -36,7 +48,30 @@ describe("parseClientMessage: valid messages", () => {
     ["height", 0],
     ["color", "#abcdef"],
   ])("accepts an update_shape of field %s", (field, value) => {
-    expect(parseClientMessage({ ...validUpdate, change: { field, value } }).ok).toBe(true);
+    expect(parseClientMessage({ ...validUpdate, changes: { [field]: value } }).ok).toBe(true);
+  });
+
+  it("accepts an update_shape that changes several fields at once", () => {
+    const result = parseClientMessage({
+      ...validUpdate,
+      changes: { x: 1, y: 2, width: 3, height: 4, color: "#fff" },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect((result.message as { changes: object }).changes).toEqual({
+        x: 1,
+        y: 2,
+        width: 3,
+        height: 4,
+        color: "#fff",
+      });
+    }
+  });
+
+  it("strips unknown keys inside changes", () => {
+    const result = parseClientMessage({ ...validUpdate, changes: { x: 1, rotation: 90 } });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect((result.message as { changes: object }).changes).toEqual({ x: 1 });
   });
 
   it("strips unknown keys so a client cannot smuggle data into the op log", () => {
@@ -107,12 +142,47 @@ describe("parseClientMessage: rejects malformed input", () => {
   });
 
   it("rejects an update whose value does not match its field", () => {
-    expect(parseClientMessage({ ...validUpdate, change: { field: "x", value: "ten" } }).ok).toBe(false);
-    expect(parseClientMessage({ ...validUpdate, change: { field: "color", value: 7 } }).ok).toBe(false);
+    expect(parseClientMessage({ ...validUpdate, changes: { x: "ten" } }).ok).toBe(false);
+    expect(parseClientMessage({ ...validUpdate, changes: { color: 7 } }).ok).toBe(false);
+    expect(parseClientMessage({ ...validUpdate, changes: { x: 1, color: "red" } }).ok).toBe(false);
   });
 
-  it("rejects an update to a field that does not exist", () => {
-    expect(parseClientMessage({ ...validUpdate, change: { field: "rotation", value: 5 } }).ok).toBe(false);
+  it.each([
+    ["empty changes", {}],
+    ["only unknown fields", { rotation: 5 }],
+    ["not an object", 5],
+    ["null", null],
+  ])("rejects an update with %s", (_name, changes) => {
+    expect(parseClientMessage({ ...validUpdate, changes }).ok).toBe(false);
+  });
+
+  it("rejects the old single-field update shape", () => {
+    expect(
+      parseClientMessage({ ...validUpdate, changes: undefined, change: { field: "x", value: 5 } }).ok,
+    ).toBe(false);
+  });
+
+  it.each([
+    ["empty changes", {}],
+    ["a color change (previews are geometry only)", { color: "#fff" }],
+    ["an out-of-range coordinate", { x: 1e9 }],
+    ["negative width", { width: -1 }],
+  ])("rejects a drag_preview with %s", (_name, changes) => {
+    expect(parseClientMessage({ ...validDrag, changes }).ok).toBe(false);
+  });
+
+  it("rejects a drag_preview without a shapeId", () => {
+    expect(parseClientMessage(omit(validDrag, "shapeId")).ok).toBe(false);
+  });
+
+  it("rejects a join_room without a numeric protocolVersion", () => {
+    expect(parseClientMessage(omit(validJoin, "protocolVersion")).ok).toBe(false);
+    expect(parseClientMessage({ ...validJoin, protocolVersion: "1" }).ok).toBe(false);
+    expect(parseClientMessage({ ...validJoin, protocolVersion: 1.5 }).ok).toBe(false);
+  });
+
+  it("accepts a join_room with any integer protocolVersion (the server decides if it is supported)", () => {
+    expect(parseClientMessage({ ...validJoin, protocolVersion: 999 }).ok).toBe(true);
   });
 
   it("rejects a negative or fractional sinceSeq", () => {
@@ -123,5 +193,25 @@ describe("parseClientMessage: rejects malformed input", () => {
   it("rejects ids longer than the limit", () => {
     expect(parseClientMessage({ ...validDelete, shapeId: "a".repeat(129) }).ok).toBe(false);
     expect(parseClientMessage({ ...validJoin, clientId: "a".repeat(129) }).ok).toBe(false);
+  });
+});
+
+describe("rejectableOpId", () => {
+  it.each(["create_shape", "update_shape", "delete_shape"])("returns the opId of a malformed %s", (type) => {
+    expect(rejectableOpId({ type, opId: "op-1", hlc: "garbage" })).toBe("op-1");
+  });
+
+  it.each([
+    ["a cursor", { type: "cursor", opId: "op-1" }],
+    ["a join_room", { type: "join_room", opId: "op-1" }],
+    ["an op without an opId", { type: "create_shape" }],
+    ["an op with a non-string opId", { type: "create_shape", opId: 5 }],
+    ["an op with an empty opId", { type: "create_shape", opId: "" }],
+    ["an op with an oversized opId", { type: "create_shape", opId: "a".repeat(129) }],
+    ["null", null],
+    ["a string", "create_shape"],
+    ["an array", []],
+  ])("returns null for %s", (_name, value) => {
+    expect(rejectableOpId(value)).toBeNull();
   });
 });

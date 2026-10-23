@@ -2,15 +2,21 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { WebSocketServer, type RawData, type WebSocket } from "ws";
 import {
+  CLOSE_UNSUPPORTED_PROTOCOL,
+  HlcDriftError,
   HybridLogicalClock,
+  PROTOCOL_VERSION,
   type ClientMessage,
   type CursorUpdate,
+  type DragPreview,
+  type ErrorCode,
   type Op,
+  type OpRejectReason,
   type ServerMessage,
 } from "@realtime-canvas/shared";
-import { OpLog } from "./op-log";
+import { OpLog, type StoredOp } from "./op-log";
 import { Room, RoomManager } from "./room";
-import { parseClientMessage } from "./validation";
+import { parseClientMessage, rejectableOpId } from "./validation";
 
 export type Logger = Pick<Console, "info" | "warn" | "error">;
 
@@ -71,11 +77,20 @@ export function createServer(opts: ServerOptions): ServerHandle {
 
   // One HLC for the whole process. Every op passes through it via
   // `.update()`, giving all rooms a single, monotonically increasing
-  // timeline.
-  const serverClock = new HybridLogicalClock("server");
+  // timeline. The clock itself refuses client timestamps that are too far
+  // ahead (see stampFor).
+  const serverClock = new HybridLogicalClock("server", Date.now, { maxDriftMs: maxClockDriftMs });
 
   function send(socket: WebSocket, message: ServerMessage): void {
     socket.send(JSON.stringify(message));
+  }
+
+  function sendError(socket: WebSocket, code: ErrorCode, message: string): void {
+    send(socket, { type: "error", code, message });
+  }
+
+  function sendReject(socket: WebSocket, opId: string, reason: OpRejectReason): void {
+    send(socket, { type: "op_reject", opId, reason });
   }
 
   function broadcastPresence(room: Room): void {
@@ -88,14 +103,24 @@ export function createServer(opts: ServerOptions): ServerHandle {
    * HLC keeps causality (the server clock never falls behind a client it
    * has heard from), but a claim far in the future would drag the server
    * clock forward and make every later op "newer" than real edits, so
-   * implausible claims are ignored and the server just ticks.
+   * implausible claims are ignored and the server just ticks. The limit
+   * lives in the clock (`maxDriftMs`); this only decides what to do when
+   * it trips.
    */
   function stampFor(claimed: Op["hlc"], clientId: string) {
-    if (claimed.physical > Date.now() + maxClockDriftMs) {
+    try {
+      return serverClock.update(claimed);
+    } catch (error) {
+      if (!(error instanceof HlcDriftError)) throw error;
       logger.warn(`[server] ignoring client HLC too far in the future (client ${clientId})`);
       return serverClock.tick();
     }
-    return serverClock.update(claimed);
+  }
+
+  /** Why an op that is not a retry cannot be applied, or null if it can. */
+  function semanticRejection(room: Room, op: Op): OpRejectReason | null {
+    if (op.type === "create_shape") return room.hasShape(op.shapeId) ? "shape_exists" : null;
+    return room.isLive(op.shapeId) ? null : "unknown_shape";
   }
 
   const wss = new WebSocketServer({
@@ -109,6 +134,19 @@ export function createServer(opts: ServerOptions): ServerHandle {
     function handleJoin(message: Extract<ClientMessage, { type: "join_room" }>): void {
       if (session) {
         logger.warn(`[server] ignoring repeated join_room from client ${session.clientId}`);
+        sendError(socket, "already_joined", "this connection has already joined a room");
+        return;
+      }
+      if (message.protocolVersion !== PROTOCOL_VERSION) {
+        logger.warn(
+          `[server] refusing join: protocol version ${message.protocolVersion}, expected ${PROTOCOL_VERSION}`,
+        );
+        sendError(
+          socket,
+          "unsupported_protocol",
+          `server speaks protocol version ${PROTOCOL_VERSION}, client sent ${message.protocolVersion}`,
+        );
+        socket.close(CLOSE_UNSUPPORTED_PROTOCOL, "unsupported protocol version");
         return;
       }
       const room = rooms.get(message.roomId);
@@ -134,6 +172,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     function handleCursor(message: CursorUpdate): void {
       if (!session) {
         logger.warn("[server] ignoring cursor from a client that has not joined a room");
+        sendError(socket, "not_joined", "join a room before sending cursor updates");
         return;
       }
       // Cursor traffic is ephemeral: never persisted, never HLC-stamped.
@@ -143,21 +182,51 @@ export function createServer(opts: ServerOptions): ServerHandle {
       session.room.broadcast(JSON.stringify(outgoing satisfies ServerMessage), socket);
     }
 
+    function handleDragPreview(message: DragPreview): void {
+      if (!session) {
+        logger.warn("[server] ignoring drag preview from a client that has not joined a room");
+        sendError(socket, "not_joined", "join a room before sending drag previews");
+        return;
+      }
+      // Ephemeral like cursors, with the same identity overwrite. A preview
+      // for a shape that does not exist (or is deleted) is dropped quietly:
+      // it is high-frequency, short-lived, and an error per frame would
+      // only add noise.
+      if (!session.room.isLive(message.shapeId)) return;
+      const outgoing: DragPreview = { ...message, roomId: session.room.id, clientId: session.clientId };
+      session.room.broadcast(JSON.stringify(outgoing satisfies ServerMessage), socket);
+    }
+
+    /** Answers a retry of an op that is already in the log with its stored sequence number, to the sender only. */
+    function reAck(room: Room, stored: StoredOp): void {
+      logger.info(`[server] re-acknowledged duplicate op ${stored.op.opId} in room ${room.id}`);
+      send(socket, { type: "op_ack", roomId: room.id, seq: stored.seq, op: stored.op });
+    }
+
     function handleOp(message: Op): void {
       if (!session) {
         logger.warn("[server] ignoring op from a client that has not joined a room");
+        sendReject(socket, message.opId, "not_joined");
         return;
       }
       const { room, clientId } = session;
-      const stampedOp: Op = { ...message, roomId: room.id, hlc: stampFor(message.hlc, clientId) };
 
-      const result = opLog.append(room.id, stampedOp);
-      if (result.status === "duplicate") {
-        // A retry of an op we already have. The original was (or will be)
-        // delivered through the normal broadcast/replay path.
-        logger.info(`[server] dropped duplicate op ${message.opId} in room ${room.id}`);
+      // A retry must be recognised BEFORE the semantic checks below: a
+      // retried create would otherwise be refused as "shape_exists" because
+      // its own first attempt created the shape.
+      const known = opLog.find(room.id, message.opId);
+      if (known) return reAck(room, known);
+
+      const rejection = semanticRejection(room, message);
+      if (rejection) {
+        logger.info(`[server] rejected op ${message.opId} in room ${room.id}: ${rejection}`);
+        sendReject(socket, message.opId, rejection);
         return;
       }
+
+      const stampedOp: Op = { ...message, roomId: room.id, hlc: stampFor(message.hlc, clientId) };
+      const result = opLog.append(room.id, stampedOp);
+      if (result.status === "duplicate") return reAck(room, result);
 
       room.applyAndCache(stampedOp);
       const ack: ServerMessage = { type: "op_ack", roomId: room.id, seq: result.seq, op: stampedOp };
@@ -167,6 +236,7 @@ export function createServer(opts: ServerOptions): ServerHandle {
     function handleFrame(raw: RawData, isBinary: boolean): void {
       if (isBinary) {
         logger.warn("[server] dropped binary frame (protocol is JSON text only)");
+        sendError(socket, "invalid_message", "binary frames are not supported; send JSON text");
         return;
       }
 
@@ -175,12 +245,18 @@ export function createServer(opts: ServerOptions): ServerHandle {
         json = JSON.parse(rawToString(raw));
       } catch {
         logger.warn("[server] dropped frame that is not valid JSON");
+        sendError(socket, "invalid_message", "frame is not valid JSON");
         return;
       }
 
       const parsed = parseClientMessage(json);
       if (!parsed.ok) {
         logger.warn(`[server] dropped invalid message - ${parsed.error}`);
+        // An op the client is waiting on gets a rejection it can match by
+        // opId; anything else gets a connection-level error.
+        const opId = rejectableOpId(json);
+        if (opId !== null) sendReject(socket, opId, "invalid");
+        else sendError(socket, "invalid_message", parsed.error);
         return;
       }
 
@@ -190,6 +266,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
           return handleJoin(message);
         case "cursor":
           return handleCursor(message);
+        case "drag_preview":
+          return handleDragPreview(message);
         case "create_shape":
         case "update_shape":
         case "delete_shape":

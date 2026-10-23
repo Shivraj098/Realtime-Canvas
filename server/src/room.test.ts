@@ -41,6 +41,34 @@ describe("Room", () => {
     expect(Object.keys(room.state)).toEqual(["s1", "s2"]);
   });
 
+  it("keeps a deleted shape as a tombstone: hasShape stays true, isLive turns false", () => {
+    const room = new Room("room1");
+    room.applyAndCache(createOp("s1", 100));
+    expect(room.isLive("s1")).toBe(true);
+
+    room.applyAndCache({
+      type: "delete_shape",
+      shapeId: "s1",
+      roomId: "room1",
+      hlc: { physical: 200, logical: 0, nodeId: "server" },
+      opId: "del-s1",
+    });
+    expect(room.hasShape("s1")).toBe(true);
+    expect(room.isLive("s1")).toBe(false);
+  });
+
+  it("reports false for both hasShape and isLive for a shape that never existed", () => {
+    const room = new Room("room1");
+    expect(room.hasShape("ghost")).toBe(false);
+    expect(room.isLive("ghost")).toBe(false);
+  });
+
+  it("does not mistake Object.prototype members for shapes", () => {
+    const room = new Room("room1");
+    expect(room.hasShape("constructor")).toBe(false);
+    expect(room.isLive("toString")).toBe(false);
+  });
+
   it("assigns each connection a color not already in use in that room", () => {
     const room = new Room("room1");
     const a = room.addClient("clientA", asWebSocket(fakeSocket()));

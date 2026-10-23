@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { WebSocket } from "ws";
+import { PROTOCOL_VERSION } from "@realtime-canvas/shared";
 
 /**
  * Smoke test for the *built artifact*. Unit and integration tests run the
@@ -39,7 +40,13 @@ child.stdout.on("data", (chunk: Buffer) => {
   socket.on("error", (error) => fail(`websocket error: ${error.message}`));
   socket.on("open", () => {
     socket.send(
-      JSON.stringify({ type: "join_room", roomId: "smoke", clientId: "smoke-client", sinceSeq: 0 }),
+      JSON.stringify({
+        type: "join_room",
+        protocolVersion: PROTOCOL_VERSION,
+        roomId: "smoke",
+        clientId: "smoke-client",
+        sinceSeq: 0,
+      }),
     );
   });
   socket.on("message", (data) => {

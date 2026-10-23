@@ -42,6 +42,29 @@ export function compareHlc(a: HlcTimestamp, b: HlcTimestamp): number {
   return a.nodeId < b.nodeId ? -1 : a.nodeId > b.nodeId ? 1 : 0;
 }
 
+export type HlcOptions = {
+  /**
+   * How far ahead of this clock's own wall time a remote timestamp may be
+   * before `update` refuses it. Unset means no limit (the original
+   * behaviour). Without a limit, one peer with a wildly wrong clock drags
+   * every clock that hears from it into the future, and every later edit
+   * is then ordered after that bogus moment.
+   */
+  maxDriftMs?: number;
+};
+
+/** Thrown by `HybridLogicalClock.update` when a remote timestamp is further ahead than `maxDriftMs`. */
+export class HlcDriftError extends Error {
+  constructor(
+    readonly remote: HlcTimestamp,
+    readonly driftMs: number,
+    readonly maxDriftMs: number,
+  ) {
+    super(`remote HLC is ${driftMs}ms ahead of the local clock (limit ${maxDriftMs}ms)`);
+    this.name = "HlcDriftError";
+  }
+}
+
 export class HybridLogicalClock {
   private physical = 0;
   private logical = 0;
@@ -49,6 +72,7 @@ export class HybridLogicalClock {
   constructor(
     private readonly nodeId: string,
     private readonly now: () => number = Date.now,
+    private readonly options: HlcOptions = {},
   ) {}
 
   /** Call when producing a new local event. Advances the clock and
@@ -69,9 +93,17 @@ export class HybridLogicalClock {
    * clock state so the local clock never falls behind a remote clock it
    * has observed — this is what makes the ordering causally consistent.
    * Returns the timestamp to assign to the receive event itself.
+   *
+   * Throws `HlcDriftError` (leaving the clock untouched) when a `maxDriftMs`
+   * limit is configured and `remote` is further ahead than that.
    */
   update(remote: HlcTimestamp): HlcTimestamp {
     const physicalNow = this.now();
+    const { maxDriftMs } = this.options;
+    if (maxDriftMs !== undefined) {
+      const driftMs = remote.physical - physicalNow;
+      if (driftMs > maxDriftMs) throw new HlcDriftError(remote, driftMs, maxDriftMs);
+    }
     const newPhysical = Math.max(this.physical, remote.physical, physicalNow);
 
     let newLogical: number;

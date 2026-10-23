@@ -85,8 +85,21 @@ describe("OpLog idempotency", () => {
   it("reports a repeated opId in the same room as a duplicate and stores nothing", () => {
     const log = new OpLog(":memory:");
     log.append("room1", makeOp("s1", 100, "same-op"));
-    expect(log.append("room1", makeOp("s1", 999, "same-op"))).toEqual({ status: "duplicate" });
+    expect(log.append("room1", makeOp("s1", 999, "same-op")).status).toBe("duplicate");
     expect(log.since("room1", 0)).toHaveLength(1);
+    log.close();
+  });
+
+  it("returns the ORIGINAL stored op and sequence number for a duplicate, not the retried payload", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("other"));
+    const original = makeOp("s1", 100, "same-op");
+    log.append("room1", original);
+    expect(log.append("room1", makeOp("s1", 999, "same-op"))).toEqual({
+      status: "duplicate",
+      seq: 2,
+      op: original,
+    });
     log.close();
   });
 
@@ -102,6 +115,25 @@ describe("OpLog idempotency", () => {
     const log = new OpLog(":memory:");
     expect(log.append("room1", makeOp("s1", 100, "shared-id")).status).toBe("appended");
     expect(log.append("room2", makeOp("s1", 100, "shared-id")).status).toBe("appended");
+    log.close();
+  });
+});
+
+describe("OpLog.find", () => {
+  it("returns the stored op and its sequence number for a known opId", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1"));
+    const op = makeOp("s2", 200);
+    log.append("room1", op);
+    expect(log.find("room1", op.opId)).toEqual({ seq: 2, op });
+    log.close();
+  });
+
+  it("returns null for an unknown opId, and for an opId that only exists in another room", () => {
+    const log = new OpLog(":memory:");
+    log.append("room1", makeOp("s1", 100, "only-in-room1"));
+    expect(log.find("room1", "nope")).toBeNull();
+    expect(log.find("room2", "only-in-room1")).toBeNull();
     log.close();
   });
 });
@@ -126,7 +158,7 @@ describe("OpLog durability", () => {
     const reopened = new OpLog(path);
     expect(reopened.latestSeq("room1")).toBe(2);
     expect(reopened.since("room1", 0)).toHaveLength(2);
-    expect(reopened.append("room1", makeOp("s1"))).toEqual({ status: "duplicate" });
+    expect(reopened.append("room1", makeOp("s1"))).toMatchObject({ status: "duplicate", seq: 1 });
     expect(reopened.append("room1", makeOp("s3"))).toEqual({ status: "appended", seq: 3 });
     reopened.close();
   });

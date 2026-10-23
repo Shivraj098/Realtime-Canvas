@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { applyOp, applyOps, type RoomState } from "./reconcile";
+import { applyOp, applyOps, getShape, isDeleted, liveShapes, type RoomState } from "./reconcile";
 import type { HlcTimestamp } from "./hlc";
-import type { Op, FieldChange } from "./protocol";
+import type { Op, ShapeChanges } from "./protocol";
 
 function hlc(physical: number, logical = 0, nodeId = "a"): HlcTimestamp {
   return { physical, logical, nodeId };
@@ -19,14 +19,27 @@ function createOp(shapeId: string, at: HlcTimestamp): Op {
 }
 
 function updateOp(shapeId: string, field: "x" | "color", value: number | string, at: HlcTimestamp): Op {
-  const change = { field, value } as FieldChange;
+  return updateManyOp(shapeId, { [field]: value }, at);
+}
+
+function updateManyOp(shapeId: string, changes: ShapeChanges, at: HlcTimestamp): Op {
   return {
     type: "update_shape",
     shapeId,
     roomId: "room1",
-    change,
+    changes,
     hlc: at,
-    opId: `update-${shapeId}-${field}-${at.physical}-${at.logical}`,
+    opId: `update-${shapeId}-${Object.keys(changes).join("+")}-${at.physical}-${at.logical}-${at.nodeId}`,
+  };
+}
+
+function deleteOp(shapeId: string, at: HlcTimestamp): Op {
+  return {
+    type: "delete_shape",
+    shapeId,
+    roomId: "room1",
+    hlc: at,
+    opId: `delete-${shapeId}-${at.physical}`,
   };
 }
 
@@ -87,29 +100,91 @@ describe("applyOp: update_shape conflict resolution", () => {
   });
 });
 
-describe("applyOp: delete_shape", () => {
-  it("removes the shape from state", () => {
-    let state: RoomState = applyOp({}, createOp("s1", hlc(100)));
-    state = applyOp(state, {
-      type: "delete_shape",
-      shapeId: "s1",
-      roomId: "room1",
-      hlc: hlc(200),
-      opId: "del-1",
-    });
-    expect(state.s1).toBeUndefined();
+describe("applyOp: update_shape with several fields", () => {
+  it("applies every field of one op under that op's single timestamp", () => {
+    const state = applyOps({}, [
+      createOp("s1", hlc(100)),
+      updateManyOp("s1", { x: 5, y: 6, color: "#fff" }, hlc(200)),
+    ]);
+    expect(state.s1).toMatchObject({ x: 5, y: 6, color: "#fff", width: 10 });
+    expect(state.s1!.lastHlc.x).toEqual(hlc(200));
+    expect(state.s1!.lastHlc.y).toEqual(hlc(200));
+    expect(state.s1!.lastHlc.width).toEqual(hlc(100)); // untouched field keeps its own timestamp
+  });
+
+  it("resolves each field independently: the fields that win apply, the ones that lose do not", () => {
+    let state = applyOps({}, [createOp("s1", hlc(100)), updateOp("s1", "x", 77, hlc(300))]);
+    state = applyOp(state, updateManyOp("s1", { x: 1, y: 2 }, hlc(200))); // loses on x, wins on y
+    expect(state.s1).toMatchObject({ x: 77, y: 2 });
+    expect(state.s1!.lastHlc.x).toEqual(hlc(300));
+    expect(state.s1!.lastHlc.y).toEqual(hlc(200));
+  });
+
+  it("returns the same state reference when every field loses", () => {
+    const state = applyOps({}, [createOp("s1", hlc(100)), updateManyOp("s1", { x: 1, y: 1 }, hlc(300))]);
+    expect(applyOp(state, updateManyOp("s1", { x: 9, y: 9 }, hlc(200)))).toBe(state);
+  });
+
+  it("returns the same state reference for an update that changes nothing (empty changes)", () => {
+    const state = applyOp({}, createOp("s1", hlc(100)));
+    expect(applyOp(state, updateManyOp("s1", {}, hlc(200)))).toBe(state);
+  });
+});
+
+describe("applyOp: delete_shape and tombstones", () => {
+  it("marks the shape deleted with the delete's HLC instead of removing it", () => {
+    const state = applyOps({}, [createOp("s1", hlc(100)), deleteOp("s1", hlc(200))]);
+    expect(state.s1).toBeDefined();
+    expect(isDeleted(state.s1!)).toBe(true);
+    expect(state.s1!.deletedAt).toEqual(hlc(200));
   });
 
   it("is a no-op when deleting a shape that doesn't exist", () => {
     const state: RoomState = {};
-    const next = applyOp(state, {
-      type: "delete_shape",
-      shapeId: "ghost",
-      roomId: "room1",
-      hlc: hlc(100),
-      opId: "del-1",
-    });
-    expect(next).toBe(state);
+    expect(applyOp(state, deleteOp("ghost", hlc(100)))).toBe(state);
+  });
+
+  it("is a no-op when deleting an already-deleted shape, keeping the first tombstone", () => {
+    const deleted = applyOps({}, [createOp("s1", hlc(100)), deleteOp("s1", hlc(200))]);
+    expect(applyOp(deleted, deleteOp("s1", hlc(300)))).toBe(deleted);
+    expect(deleted.s1!.deletedAt).toEqual(hlc(200));
+  });
+
+  it("does not resurrect a deleted shape when an old create is replayed", () => {
+    const create = createOp("s1", hlc(100));
+    const deleted = applyOps({}, [create, deleteOp("s1", hlc(200))]);
+    const replayed = applyOp(deleted, create);
+    expect(replayed).toBe(deleted);
+    expect(liveShapes(replayed)).toEqual({});
+  });
+
+  it("ignores an update to a deleted shape, even one with a later timestamp", () => {
+    const deleted = applyOps({}, [createOp("s1", hlc(100)), deleteOp("s1", hlc(200))]);
+    expect(applyOp(deleted, updateOp("s1", "x", 5, hlc(900)))).toBe(deleted);
+  });
+
+  it("liveShapes returns only shapes that are not tombstones", () => {
+    const state = applyOps({}, [
+      createOp("keep", hlc(100)),
+      createOp("gone", hlc(110)),
+      deleteOp("gone", hlc(120)),
+    ]);
+    expect(Object.keys(liveShapes(state))).toEqual(["keep"]);
+  });
+});
+
+describe("shape ids that collide with Object.prototype members", () => {
+  it.each(["constructor", "toString", "hasOwnProperty", "__proto__"])("treats %s as an ordinary id", (id) => {
+    let state = applyOp({}, createOp(id, hlc(100)));
+    expect(getShape(state, id)).toBeDefined();
+    state = applyOp(state, updateOp(id, "x", 5, hlc(200)));
+    expect(getShape(state, id)!.x).toBe(5);
+    state = applyOp(state, deleteOp(id, hlc(300)));
+    expect(isDeleted(getShape(state, id)!)).toBe(true);
+  });
+
+  it("getShape does not find inherited members on a state that lacks them", () => {
+    expect(getShape({}, "constructor")).toBeUndefined();
   });
 });
 
@@ -157,5 +232,36 @@ describe("convergence: the actual CRDT property", () => {
     const withoutReplay = applyOps({}, ops);
     expect(withDuplicateReplay).toEqual(withoutReplay);
     expect(withDuplicateReplay.s1!.x).toBe(50);
+  });
+
+  it("converges for every delivery order of concurrent updates (different and same fields)", () => {
+    const create = createOp("s1", hlc(100));
+    const concurrent = [
+      updateManyOp("s1", { x: 1, y: 1 }, hlc(200, 0, "clientA")),
+      updateManyOp("s1", { x: 2, color: "#0f0" }, hlc(200, 0, "clientB")),
+      updateManyOp("s1", { y: 3, width: 30 }, hlc(150, 5, "clientC")),
+    ];
+    const permutations = (items: Op[]): Op[][] =>
+      items.length <= 1
+        ? [items]
+        : items.flatMap((item, i) =>
+            permutations([...items.slice(0, i), ...items.slice(i + 1)]).map((rest) => [item, ...rest]),
+          );
+
+    const results = permutations(concurrent).map((order) => applyOps({}, [create, ...order]));
+    expect(results).toHaveLength(6);
+    for (const result of results) expect(result).toEqual(results[0]);
+    // clientB wins x (same physical/logical as A, nodeId "clientB" > "clientA"); A wins y over C (physical 200 > 150).
+    expect(results[0]!.s1).toMatchObject({ x: 2, y: 1, width: 30, color: "#0f0" });
+  });
+
+  it("converges on which shapes are visible when a delete races with updates", () => {
+    const create = createOp("s1", hlc(100));
+    const update = updateOp("s1", "x", 5, hlc(300)); // timestamp later than the delete
+    const del = deleteOp("s1", hlc(200));
+    const updateFirst = applyOps({}, [create, update, del]);
+    const deleteFirst = applyOps({}, [create, del, update]);
+    expect(liveShapes(updateFirst)).toEqual({});
+    expect(liveShapes(deleteFirst)).toEqual({});
   });
 });

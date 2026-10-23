@@ -38,22 +38,44 @@ const shapeFields = z.object({
   color,
 });
 
-const fieldChange = z.discriminatedUnion("field", [
-  z.object({ field: z.literal("x"), value: coordinate }),
-  z.object({ field: z.literal("y"), value: coordinate }),
-  z.object({ field: z.literal("width"), value: dimension }),
-  z.object({ field: z.literal("height"), value: dimension }),
-  z.object({ field: z.literal("color"), value: color }),
-]);
+const atLeastOneField = (value: object): boolean => Object.keys(value).length > 0;
+
+// Unknown keys are stripped first, then the emptiness check runs, so an
+// object containing only junk keys is refused rather than accepted as a no-op.
+const shapeChanges = z
+  .object({
+    x: coordinate.optional(),
+    y: coordinate.optional(),
+    width: dimension.optional(),
+    height: dimension.optional(),
+    color: color.optional(),
+  })
+  .refine(atLeastOneField, "must change at least one field");
+
+const geometryChanges = z
+  .object({
+    x: coordinate.optional(),
+    y: coordinate.optional(),
+    width: dimension.optional(),
+    height: dimension.optional(),
+  })
+  .refine(atLeastOneField, "must change at least one field");
 
 const opBase = { shapeId: id, roomId, hlc, opId: id };
 
 const clientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("create_shape"), ...opBase, fields: shapeFields }),
-  z.object({ type: z.literal("update_shape"), ...opBase, change: fieldChange }),
+  z.object({ type: z.literal("update_shape"), ...opBase, changes: shapeChanges }),
   z.object({ type: z.literal("delete_shape"), ...opBase }),
   z.object({ type: z.literal("cursor"), roomId, clientId: id, x: coordinate, y: coordinate, color }),
-  z.object({ type: z.literal("join_room"), roomId, clientId: id, sinceSeq: z.number().int().min(0) }),
+  z.object({ type: z.literal("drag_preview"), roomId, clientId: id, shapeId: id, changes: geometryChanges }),
+  z.object({
+    type: z.literal("join_room"),
+    protocolVersion: z.number().int().min(0),
+    roomId,
+    clientId: id,
+    sinceSeq: z.number().int().min(0),
+  }),
 ]);
 
 export type ParseResult = { ok: true; message: ClientMessage } | { ok: false; error: string };
@@ -72,4 +94,21 @@ export function parseClientMessage(value: unknown): ParseResult {
   const issue = result.error.issues[0];
   const path = issue && issue.path.length > 0 ? issue.path.join(".") : "(message)";
   return { ok: false, error: `${path}: ${issue?.message ?? "invalid"}` };
+}
+
+const OP_TYPES = new Set(["create_shape", "update_shape", "delete_shape"]);
+
+/**
+ * When a frame failed validation, tells whether it was recognisably an op
+ * and returns its `opId`, so the server can answer with an `op_reject` the
+ * client can match to its pending op. Without it a client would wait
+ * forever on an op the server silently dropped. Returns null for anything
+ * that is not an op with a usable id.
+ */
+export function rejectableOpId(value: unknown): string | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { type, opId } = value as { type?: unknown; opId?: unknown };
+  if (typeof type !== "string" || !OP_TYPES.has(type)) return null;
+  if (typeof opId !== "string" || opId.length < 1 || opId.length > MAX_ID_LENGTH) return null;
+  return opId;
 }

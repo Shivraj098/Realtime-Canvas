@@ -3,7 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
-import { applyOps, type ClientMessage, type Op, type ServerMessage } from "@realtime-canvas/shared";
+import {
+  applyOps,
+  CLOSE_UNSUPPORTED_PROTOCOL,
+  liveShapes,
+  PROTOCOL_VERSION,
+  type ClientMessage,
+  type Op,
+  type ServerMessage,
+} from "@realtime-canvas/shared";
 import { createServer, type ServerHandle, type ServerOptions } from "./app";
 
 /**
@@ -100,7 +108,7 @@ async function joinRoom(
   sinceSeq = 0,
 ): Promise<Connection> {
   const connection = await connect(server);
-  send(connection, { type: "join_room", roomId, clientId, sinceSeq });
+  send(connection, { type: "join_room", protocolVersion: PROTOCOL_VERSION, roomId, clientId, sinceSeq });
   return connection;
 }
 
@@ -109,6 +117,15 @@ async function joinFresh(server: ServerHandle, roomId: string, clientId: string)
   const connection = await joinRoom(server, roomId, clientId);
   await connection.inbox.next("sync_snapshot");
   return connection;
+}
+
+/** Sends something that is deliberately not a valid ClientMessage. */
+function sendRaw(connection: Connection, value: unknown): void {
+  connection.socket.send(JSON.stringify(value));
+}
+
+function deleteShape(shapeId: string, opId = `del-${shapeId}`): ClientMessage {
+  return { type: "delete_shape", shapeId, roomId: "room1", hlc: claimedHlc(), opId };
 }
 
 function claimedHlc(physical = Date.now(), nodeId = "client") {
@@ -131,7 +148,7 @@ function updateX(shapeId: string, value: number, opId: string, nodeId = "client"
     type: "update_shape",
     shapeId,
     roomId: "room1",
-    change: { field: "x", value },
+    changes: { x: value },
     hlc: claimedHlc(Date.now(), nodeId),
     opId,
   };
@@ -202,12 +219,19 @@ describe("joining a room", () => {
   it("ignores a second join_room on the same connection", async () => {
     const server = startServer();
     const client = await joinFresh(server, "room1", "clientA");
-    send(client, { type: "join_room", roomId: "room2", clientId: "clientA", sinceSeq: 0 });
+    send(client, {
+      type: "join_room",
+      protocolVersion: PROTOCOL_VERSION,
+      roomId: "room2",
+      clientId: "clientA",
+      sinceSeq: 0,
+    });
     send(client, createShape("shape1"));
 
     const ack = await client.inbox.next("op_ack");
     expect(ack.op.roomId).toBe("room1"); // still in the original room
     expect(client.inbox.pending("sync_snapshot")).toBe(0); // no second snapshot
+    expect((await client.inbox.next("error")).code).toBe("already_joined");
   });
 });
 
@@ -312,7 +336,7 @@ describe("conflict resolution", () => {
       type: "update_shape",
       shapeId: "shape1",
       roomId: "room1",
-      change: { field: "color", value: "#ff0000" },
+      changes: { color: "#ff0000" },
       hlc: claimedHlc(),
       opId: "recolor",
     });
@@ -414,8 +438,10 @@ describe("idempotent ops", () => {
     send(client, createShape("probe"));
 
     const first = await client.inbox.next("op_ack");
+    const retryAck = await client.inbox.next("op_ack");
     const probe = await client.inbox.next("op_ack");
     expect(first.seq).toBe(1);
+    expect(retryAck).toEqual(first); // the retry is answered with the stored ack
     expect(probe.seq).toBe(2); // the duplicate consumed no sequence number
     expect(client.inbox.pending("op_ack")).toBe(0);
   });
@@ -434,6 +460,7 @@ describe("idempotent ops", () => {
 
     send(clientA, updateX("shape1", 1, "a-move", "clientA")); // A retries its old op
     send(clientA, createShape("probe"));
+    expect((await clientA.inbox.next("op_ack")).seq).toBe(2); // the retry is re-acked with its original seq
     const probe = await clientA.inbox.next("op_ack");
     expect(probe.seq).toBe(4); // create, a-move, b-move, probe - the retry added nothing
 
@@ -486,6 +513,8 @@ describe("hostile and malformed input", () => {
     expect(ack.seq).toBe(1); // none of the bad frames were persisted
     expect(logger.warn).toHaveBeenCalledTimes(4);
     expect(logger.error).not.toHaveBeenCalled();
+    // The sender is told, rather than left guessing: one error per bad frame.
+    expect(client.inbox.pending("error")).toBe(4);
   });
 
   it("deliberately ignores ops and cursors sent before joining a room", async () => {
@@ -495,8 +524,20 @@ describe("hostile and malformed input", () => {
 
     send(client, createShape("too-early"));
     send(client, { type: "cursor", roomId: "room1", clientId: "x", x: 1, y: 1, color: "#fff" });
-    send(client, { type: "join_room", roomId: "room1", clientId: "clientA", sinceSeq: 0 });
+    send(client, {
+      type: "join_room",
+      protocolVersion: PROTOCOL_VERSION,
+      roomId: "room1",
+      clientId: "clientA",
+      sinceSeq: 0,
+    });
     await client.inbox.next("sync_snapshot");
+    expect(await client.inbox.next("op_reject")).toEqual({
+      type: "op_reject",
+      opId: "op-too-early",
+      reason: "not_joined",
+    });
+    expect((await client.inbox.next("error")).code).toBe("not_joined");
     send(client, createShape("probe"));
 
     expect((await client.inbox.next("op_ack")).seq).toBe(1);
@@ -563,6 +604,357 @@ describe("clock drift protection", () => {
     const ack = await client.inbox.next("op_ack");
 
     expect(ack.op.hlc.physical).toBeGreaterThanOrEqual(slightlyAhead);
+  });
+});
+
+describe("retries of ops the server already has", () => {
+  it("re-acknowledges a retry to the sender only, with the original sequence number and stamped op", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+
+    send(clientA, createShape("shape1", "room1", "op-x"));
+    const original = await clientA.inbox.next("op_ack");
+    await clientB.inbox.next("op_ack");
+
+    send(clientA, createShape("shape1", "room1", "op-x")); // retry
+    const retryAck = await clientA.inbox.next("op_ack");
+    expect(retryAck).toEqual(original);
+
+    // B must not hear about the retry: its next ack is the probe's.
+    send(clientA, createShape("probe"));
+    expect((await clientB.inbox.next("op_ack")).seq).toBe(2);
+    expect(clientB.inbox.pending("op_ack")).toBe(0);
+  });
+
+  it("recognises a retried create as a retry instead of refusing it as shape_exists", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("shape1", "room1", "op-x"));
+    await client.inbox.next("op_ack");
+
+    send(client, createShape("shape1", "room1", "op-x"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+    expect(client.inbox.pending("op_reject")).toBe(0);
+  });
+
+  it("still re-acknowledges a retried create after the shape has since been deleted", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("shape1", "room1", "op-x"));
+    await client.inbox.next("op_ack");
+    send(client, deleteShape("shape1"));
+    await client.inbox.next("op_ack");
+
+    send(client, createShape("shape1", "room1", "op-x"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+    expect(client.inbox.pending("op_reject")).toBe(0);
+  });
+});
+
+describe("rejected ops", () => {
+  it("rejects an update to a shape that does not exist, persisting nothing", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+
+    send(client, updateX("ghost", 5, "update-ghost"));
+    expect(await client.inbox.next("op_reject")).toEqual({
+      type: "op_reject",
+      opId: "update-ghost",
+      reason: "unknown_shape",
+    });
+
+    send(client, createShape("probe"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+  });
+
+  it("rejects a delete of a shape that does not exist", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, deleteShape("ghost", "delete-ghost"));
+    expect(await client.inbox.next("op_reject")).toMatchObject({
+      opId: "delete-ghost",
+      reason: "unknown_shape",
+    });
+  });
+
+  it("rejects a create for a shapeId that already exists, leaving the shape unchanged", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("shape1", "room1", "first"));
+    await client.inbox.next("op_ack");
+
+    send(client, {
+      ...createShape("shape1", "room1", "second"),
+      fields: { x: 99, y: 99, width: 1, height: 1, color: "#111111" },
+    } as ClientMessage);
+    expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "second", reason: "shape_exists" });
+
+    const late = await joinRoom(server, "room1", "clientB");
+    const { shapes, latestSeq } = await late.inbox.next("sync_snapshot");
+    expect(latestSeq).toBe(1);
+    expect(shapes.shape1?.x).toBe(0);
+  });
+
+  it("rejects an update to a deleted shape, and a second delete of it", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("shape1"));
+    await client.inbox.next("op_ack");
+    send(client, deleteShape("shape1", "delete-1"));
+    await client.inbox.next("op_ack");
+
+    send(client, updateX("shape1", 5, "late-update"));
+    send(client, deleteShape("shape1", "delete-2"));
+    expect(await client.inbox.next("op_reject")).toMatchObject({
+      opId: "late-update",
+      reason: "unknown_shape",
+    });
+    expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "delete-2", reason: "unknown_shape" });
+  });
+
+  it("refuses to reuse the id of a deleted shape", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("shape1", "room1", "create-1"));
+    await client.inbox.next("op_ack");
+    send(client, deleteShape("shape1"));
+    await client.inbox.next("op_ack");
+
+    send(client, createShape("shape1", "room1", "create-2"));
+    expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "create-2", reason: "shape_exists" });
+  });
+
+  it("tells only the sender about a rejection", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+
+    send(clientA, updateX("ghost", 5, "update-ghost"));
+    await clientA.inbox.next("op_reject");
+    send(clientA, createShape("probe"));
+    expect((await clientB.inbox.next("op_ack")).seq).toBe(1);
+    expect(clientB.inbox.pending("op_reject")).toBe(0);
+  });
+});
+
+describe("deleting shapes", () => {
+  it("broadcasts the delete, and keeps a tombstone that a late joiner receives", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+    send(clientA, createShape("shape1"));
+    await clientA.inbox.next("op_ack");
+    await clientB.inbox.next("op_ack");
+
+    send(clientA, deleteShape("shape1"));
+    expect((await clientB.inbox.next("op_ack")).op.type).toBe("delete_shape");
+
+    const late = await joinRoom(server, "room1", "clientC");
+    const { shapes } = await late.inbox.next("sync_snapshot");
+    expect(shapes.shape1?.deletedAt).toBeDefined();
+    expect(liveShapes(shapes)).toEqual({});
+  });
+
+  it("brings a returning client to the same state by replay as a fresh client gets by snapshot", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    send(clientA, createShape("shape1"));
+    const created = await clientA.inbox.next("op_ack");
+    clientA.socket.close();
+    await waitForClose(clientA.socket);
+
+    const clientB = await joinFresh(server, "room1", "clientB");
+    send(clientB, deleteShape("shape1"));
+    await clientB.inbox.next("op_ack");
+
+    const returning = await joinRoom(server, "room1", "clientA", created.seq);
+    const replayed = await returning.inbox.next("op_ack");
+    const replayedState = applyOps({}, [created.op, replayed.op]);
+
+    const fresh = await joinRoom(server, "room1", "clientC");
+    const { shapes } = await fresh.inbox.next("sync_snapshot");
+    expect(liveShapes(replayedState)).toEqual(liveShapes(shapes));
+    expect(liveShapes(shapes)).toEqual({});
+  });
+
+  it.each(["constructor", "toString", "__proto__"])(
+    "handles a shape whose id is %s, which collides with an Object.prototype member",
+    async (shapeId) => {
+      const server = startServer();
+      const client = await joinFresh(server, "room1", "clientA");
+
+      send(client, createShape(shapeId));
+      expect((await client.inbox.next("op_ack")).op).toMatchObject({ shapeId });
+      send(client, updateX(shapeId, 7, "move"));
+      await client.inbox.next("op_ack");
+
+      const late = await joinRoom(server, "room1", "clientB");
+      const { shapes } = await late.inbox.next("sync_snapshot");
+      expect(Object.keys(shapes)).toEqual([shapeId]);
+      expect(Object.getOwnPropertyDescriptor(shapes, shapeId)?.value).toMatchObject({ x: 7 });
+    },
+  );
+});
+
+describe("multi-field updates", () => {
+  it("applies several fields as one op: one sequence number, one broadcast, one timestamp", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+    send(clientA, createShape("shape1"));
+    await clientA.inbox.next("op_ack");
+    await clientB.inbox.next("op_ack");
+
+    send(clientA, {
+      type: "update_shape",
+      shapeId: "shape1",
+      roomId: "room1",
+      changes: { x: 40, y: 50 },
+      hlc: claimedHlc(),
+      opId: "drag-1",
+    });
+    const ack = await clientB.inbox.next("op_ack");
+    expect(ack.seq).toBe(2);
+    expect(ack.op).toMatchObject({ opId: "drag-1", changes: { x: 40, y: 50 } });
+
+    const late = await joinRoom(server, "room1", "clientC");
+    const { shapes, latestSeq } = await late.inbox.next("sync_snapshot");
+    expect(latestSeq).toBe(2); // the whole move cost one log entry
+    expect(shapes.shape1).toMatchObject({ x: 40, y: 50 });
+    expect(shapes.shape1?.lastHlc.x).toEqual(shapes.shape1?.lastHlc.y);
+  });
+});
+
+describe("drag previews", () => {
+  const preview = (shapeId: string, x: number, clientId = "clientA", roomId = "room1"): ClientMessage => ({
+    type: "drag_preview",
+    roomId,
+    clientId,
+    shapeId,
+    changes: { x, y: x },
+  });
+
+  it("relays a preview to other clients but not back to the sender, never persisting it", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+    send(clientA, createShape("shape1"));
+    await clientA.inbox.next("op_ack");
+    await clientB.inbox.next("op_ack");
+
+    send(clientA, preview("shape1", 33));
+    expect(await clientB.inbox.next("drag_preview")).toMatchObject({
+      shapeId: "shape1",
+      clientId: "clientA",
+      changes: { x: 33, y: 33 },
+    });
+
+    send(clientA, updateX("shape1", 1, "commit"));
+    expect((await clientA.inbox.next("op_ack")).seq).toBe(2); // the preview consumed no sequence number
+    expect(clientA.inbox.pending("drag_preview")).toBe(0);
+  });
+
+  it("stamps the sender's real identity and room instead of trusting the payload", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+    const outsider = await joinFresh(server, "other-room", "clientC");
+    send(clientA, createShape("shape1"));
+    await clientA.inbox.next("op_ack");
+    await clientB.inbox.next("op_ack");
+
+    send(clientA, preview("shape1", 5, "clientB", "other-room"));
+    const relayed = await clientB.inbox.next("drag_preview");
+    expect(relayed).toMatchObject({ clientId: "clientA", roomId: "room1" });
+
+    send(outsider, createShape("probe", "other-room"));
+    await outsider.inbox.next("op_ack");
+    expect(outsider.inbox.pending("drag_preview")).toBe(0); // never leaked into the room named in the payload
+  });
+
+  it("quietly drops a preview for a shape that does not exist or has been deleted", async () => {
+    const server = startServer();
+    const clientA = await joinFresh(server, "room1", "clientA");
+    const clientB = await joinFresh(server, "room1", "clientB");
+    send(clientA, createShape("real"));
+    send(clientA, createShape("gone"));
+    send(clientA, deleteShape("gone"));
+    for (let i = 0; i < 3; i++) await clientA.inbox.next("op_ack");
+
+    send(clientA, preview("ghost", 1));
+    send(clientA, preview("gone", 2));
+    send(clientA, preview("real", 3));
+
+    expect((await clientB.inbox.next("drag_preview")).shapeId).toBe("real");
+    expect(clientB.inbox.pending("drag_preview")).toBe(0);
+    expect(clientA.inbox.pending("error")).toBe(0); // dropped without an error per frame
+  });
+
+  it("answers a preview sent before joining with a not_joined error", async () => {
+    const server = startServer();
+    const client = await connect(server);
+    send(client, preview("shape1", 1));
+    expect((await client.inbox.next("error")).code).toBe("not_joined");
+  });
+});
+
+describe("telling the client what went wrong", () => {
+  it("rejects an invalid op by opId so the client can drop it from its pending queue", async () => {
+    const logger = quietLogger();
+    const server = startServer({ logger });
+    const client = await joinFresh(server, "room1", "clientA");
+
+    sendRaw(client, { type: "create_shape", shapeId: "s1", opId: "bad-op" }); // no hlc, no fields
+    expect(await client.inbox.next("op_reject")).toEqual({
+      type: "op_reject",
+      opId: "bad-op",
+      reason: "invalid",
+    });
+    expect(client.inbox.pending("error")).toBe(0);
+  });
+
+  it("answers a message that is not a recognisable op with a connection-level error", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+
+    sendRaw(client, { type: "drop_database" });
+    const error = await client.inbox.next("error");
+    expect(error.code).toBe("invalid_message");
+    expect(error.message.length).toBeGreaterThan(0);
+    expect(client.inbox.pending("op_reject")).toBe(0);
+  });
+
+  it("refuses a join from an unsupported protocol version, tells the client why, and closes with a distinct code", async () => {
+    const server = startServer();
+    const existing = await joinFresh(server, "room1", "clientA");
+    await existing.inbox.next("presence");
+
+    const outdated = await connect(server);
+    const closed = waitForClose(outdated.socket);
+    sendRaw(outdated, {
+      type: "join_room",
+      protocolVersion: PROTOCOL_VERSION + 1,
+      roomId: "room1",
+      clientId: "clientB",
+      sinceSeq: 0,
+    });
+
+    expect((await outdated.inbox.next("error")).code).toBe("unsupported_protocol");
+    expect(await closed).toBe(CLOSE_UNSUPPORTED_PROTOCOL);
+
+    // It never became a member of the room: no presence change, no snapshot.
+    send(existing, createShape("probe"));
+    await existing.inbox.next("op_ack");
+    expect(existing.inbox.pending("presence")).toBe(0);
+    expect(outdated.inbox.pending("sync_snapshot")).toBe(0);
+  });
+
+  it("refuses a join that carries no protocol version at all", async () => {
+    const server = startServer();
+    const client = await connect(server);
+    sendRaw(client, { type: "join_room", roomId: "room1", clientId: "clientA", sinceSeq: 0 });
+    expect((await client.inbox.next("error")).code).toBe("invalid_message");
   });
 });
 
