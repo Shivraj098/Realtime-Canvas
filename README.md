@@ -38,13 +38,15 @@ checkpoint.
       reconciliation — all test-covered
 - [x] **Phase 2 — Server**: WebSocket server, room management, SQLite op
       log, reconnect/replay
-- [ ] **Phase 3 — Client core**: connection handling, local state store
-- [ ] **Phase 4 — Client canvas**: shape rendering, drag/create/delete,
+- [x] **Phase 3 — Client core**: connection handling, local state store
+- [x] **Phase 4 — Client canvas**: shape rendering, drag/create/delete,
       live cursors
 - [ ] **Phase 5 — Deployment**: Dockerized server on Fly.io, static
       client on Vercel
 
 ## Development
+
+Requires Node.js 22.12 or newer.
 
 ```bash
 npm install

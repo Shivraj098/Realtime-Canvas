@@ -12,9 +12,10 @@
     "client"
   ],
   "scripts": {
-    "build": "npm run build -w shared && npm run build -w server",
-    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server",
-    "test": "npm run test -w shared && npm run test -w server",
+    "e2e": "npm run build && npm run e2e -w client",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w server && npm run typecheck -w client",
+    "test": "npm run test -w shared && npm run test -w server && npm run test -w client",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

@@ -7,3 +7,5 @@ data/
 *.sqlite-journal
 .env
 .env.local
+playwright-report/
+test-results/
