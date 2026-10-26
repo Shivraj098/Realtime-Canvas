@@ -224,3 +224,34 @@ test("the canvas is sharp on dense screens and follows the window size", async (
   await page.setViewportSize({ width: 700, height: 500 });
   await expect.poll(size).toEqual({ cssWidth: 700, width: 1400, cssHeight: 500, height: 1000 });
 });
+
+test("the server reports that it is healthy", async ({ request }) => {
+  const response = await request.get(`http://localhost:${SERVER_PORT}/health`);
+  expect(response.status()).toBe(200);
+  expect(await response.json()).toMatchObject({ status: "ok" });
+});
+
+test("a full board says so, and the shape that did not fit disappears for everyone", async ({ browser }) => {
+  const room = uniqueRoom();
+  const alice = await openBoard(await browser.newContext(), room);
+  const bob = await openBoard(await browser.newContext(), room);
+
+  // The test server allows 25 shapes per room. Fill the board with clicks.
+  const place = async (index: number) => {
+    await alice.keyboard.press("r");
+    await alice.mouse.click(160 + (index % 8) * 140, 160 + Math.floor(index / 8) * 110);
+  };
+  for (let i = 0; i < 25; i++) await place(i);
+  await expect(shapeItems(alice)).toHaveCount(25);
+  await expect(shapeItems(bob)).toHaveCount(25);
+  await expect(alice.locator("#notice")).toBeHidden();
+
+  await place(25);
+
+  await expect(alice.locator("#notice")).toBeVisible();
+  await expect(alice.locator("#notice")).toContainText("board is full");
+  // The optimistic shape was taken back, and Bob never saw it.
+  await expect(shapeItems(alice)).toHaveCount(25);
+  await expect(shapeItems(bob)).toHaveCount(25);
+  await expect(alice.locator("#pending")).toHaveAttribute("data-count", "0");
+});

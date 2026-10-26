@@ -73,12 +73,19 @@ export type RemotePreview = {
 
 /** What the caller needs to react to after feeding the engine a message. */
 export type ReceiveEffect = {
-  /** The server refused an op. `wasPending` is false if the engine no longer held it. */
-  rejected?: { opId: string; reason: OpRejectReason; wasPending: boolean };
+  /**
+   * The server refused an op. `wasPending` is false if the engine no longer held it.
+   * `retryable` means the refusal was about timing, not about the op: the op is STILL
+   * queued and the caller should send it again after a pause.
+   */
+  rejected?: { opId: string; reason: OpRejectReason; wasPending: boolean; retryable: boolean };
   error?: { code: ErrorCode; message: string };
   /** An ack skipped a sequence number: reconnect and resume from `lastSeq`. */
   resyncNeeded?: boolean;
 };
+
+/** Rejections that are about timing rather than about the op, so the op is kept and sent again. */
+const RETRYABLE_REJECTIONS: readonly OpRejectReason[] = ["rate_limited"];
 
 const DEFAULT_MAX_PENDING = 1000;
 const DEFAULT_PREVIEW_TTL_MS = 2000;
@@ -283,9 +290,22 @@ export class SyncEngine {
         if (message.roomId !== this.roomId) return {};
         return this.applyAck(message);
       case "op_reject": {
+        // "Too fast" says nothing about the op itself. Dropping it would throw
+        // away the user's work for sending it at the wrong moment, so it stays queued.
+        if (RETRYABLE_REJECTIONS.includes(message.reason)) {
+          const stillPending = this.pending.some((op) => op.opId === message.opId);
+          return {
+            rejected: {
+              opId: message.opId,
+              reason: message.reason,
+              wasPending: stillPending,
+              retryable: stillPending,
+            },
+          };
+        }
         const wasPending = this.removePending(message.opId);
         if (wasPending) this.changed();
-        return { rejected: { opId: message.opId, reason: message.reason, wasPending } };
+        return { rejected: { opId: message.opId, reason: message.reason, wasPending, retryable: false } };
       }
       case "error":
         return { error: { code: message.code, message: message.message } };

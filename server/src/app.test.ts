@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
 import {
   applyOps,
+  CLOSE_POLICY_VIOLATION,
+  CLOSE_ROOM_REFUSED,
+  CLOSE_TRY_AGAIN_LATER,
   CLOSE_UNSUPPORTED_PROTOCOL,
   liveShapes,
   PROTOCOL_VERSION,
@@ -13,6 +16,7 @@ import {
   type ServerMessage,
 } from "@realtime-canvas/shared";
 import { createServer, type ServerHandle, type ServerOptions } from "./app";
+import { OpLog } from "./op-log";
 
 /**
  * Integration tests: a real WebSocketServer (port 0 = an OS-assigned free
@@ -964,5 +968,740 @@ describe("shutdown", () => {
     await joinFresh(server, "room1", "clientA");
     await expect(server.close()).resolves.toBeUndefined();
     servers.splice(servers.indexOf(server), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hardening: health, origins, limits, heartbeat, idle rooms and snapshots.
+// ---------------------------------------------------------------------------
+
+/** A clock the test controls, for rate limits and idle tracking. */
+function controllableClock(start = 1_000_000) {
+  let current = start;
+  return { now: () => current, advance: (ms: number) => (current += ms) };
+}
+
+/** Polls until a condition holds. Used for things the server does on its own schedule. */
+async function until(condition: () => boolean, what: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+type Attempt = { opened: true; connection: Connection } | { opened: false; status: number };
+
+/** Opens a WebSocket with an optional Origin and reports whether the server let it in. */
+function attemptConnect(server: ServerHandle, origin?: string): Promise<Attempt> {
+  return new Promise((resolve) => {
+    const socket = new WebSocket(`ws://localhost:${server.port}`, origin ? { origin } : undefined);
+    sockets.push(socket);
+    socket.on("error", () => {});
+    socket.once("open", () => resolve({ opened: true, connection: { socket, inbox: new Inbox(socket) } }));
+    socket.once("unexpected-response", (_request, response) =>
+      resolve({ opened: false, status: response.statusCode ?? 0 }),
+    );
+  });
+}
+
+/** Joins and reports how the server closed the connection, for joins that are refused. */
+async function joinAndExpectClose(
+  server: ServerHandle,
+  roomId: string,
+  clientId = "someone",
+): Promise<{ connection: Connection; closeCode: number }> {
+  const connection = await connect(server);
+  const closed = waitForClose(connection.socket);
+  send(connection, { type: "join_room", protocolVersion: PROTOCOL_VERSION, roomId, clientId, sinceSeq: 0 });
+  return { connection, closeCode: await closed };
+}
+
+async function healthOf(server: ServerHandle, init?: RequestInit): Promise<Response> {
+  return fetch(`http://localhost:${server.port}/health`, init);
+}
+
+describe("health check", () => {
+  it("answers 200 with counts and no room ids", async () => {
+    const server = startServer();
+    await joinFresh(server, "a-secret-room-id", "clientA");
+
+    const response = await healthOf(server);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({ status: "ok", rooms: 1, connections: 1 });
+    expect(typeof body.uptimeSeconds).toBe("number");
+    expect(JSON.stringify(body)).not.toContain("a-secret-room-id");
+  });
+
+  it("answers HEAD without a body", async () => {
+    const server = startServer();
+    const response = await healthOf(server, { method: "HEAD" });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("");
+  });
+
+  it("answers 404 for other paths and for methods it does not serve", async () => {
+    const server = startServer();
+    expect((await fetch(`http://localhost:${server.port}/rooms`)).status).toBe(404);
+    expect((await healthOf(server, { method: "POST" })).status).toBe(404);
+    expect((await fetch(`http://localhost:${server.port}/health/extra`)).status).toBe(404);
+  });
+
+  it("identifies the service at the root", async () => {
+    const server = startServer();
+    const response = await fetch(`http://localhost:${server.port}/`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("realtime-canvas");
+  });
+
+  it("reports 503, and says so in the log, when the database cannot be read", async () => {
+    const logger = quietLogger();
+    const server = startServer({ logger });
+    server.opLog.close();
+    const response = await healthOf(server);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ status: "error" });
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it("works alongside WebSocket traffic on the same port", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    expect((await healthOf(server)).status).toBe(200);
+    send(client, createShape("shape1"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+  });
+});
+
+describe("origin check", () => {
+  it("lets any origin in when no list is configured", async () => {
+    const server = startServer();
+    expect((await attemptConnect(server, "https://anything.example")).opened).toBe(true);
+    expect((await attemptConnect(server)).opened).toBe(true);
+  });
+
+  it("lets a listed origin in and turns every other one away with 403", async () => {
+    const logger = quietLogger();
+    const server = startServer({ allowedOrigins: ["https://app.example.com"], logger });
+
+    expect((await attemptConnect(server, "https://app.example.com")).opened).toBe(true);
+    expect(await attemptConnect(server, "https://evil.example.net")).toEqual({ opened: false, status: 403 });
+    expect(await attemptConnect(server, "https://app.example.com.evil.net")).toEqual({
+      opened: false,
+      status: 403,
+    });
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it("turns away a connection with no Origin header at all once a list is configured", async () => {
+    const server = startServer({ allowedOrigins: ["https://app.example.com"] });
+    expect(await attemptConnect(server)).toEqual({ opened: false, status: 403 });
+  });
+
+  it("supports wildcard subdomains", async () => {
+    const server = startServer({ allowedOrigins: ["https://*.example.com"] });
+    expect((await attemptConnect(server, "https://preview-1.example.com")).opened).toBe(true);
+    expect(await attemptConnect(server, "https://example.com")).toEqual({ opened: false, status: 403 });
+  });
+
+  it("serves plain HTTP regardless of origin: the health check is for the platform, not a browser", async () => {
+    const server = startServer({ allowedOrigins: ["https://app.example.com"] });
+    expect((await healthOf(server, { headers: { Origin: "https://evil.example.net" } })).status).toBe(200);
+  });
+
+  it("a refused connection costs the server nothing: no room, no client", async () => {
+    const server = startServer({ allowedOrigins: ["https://app.example.com"] });
+    await attemptConnect(server, "https://evil.example.net");
+    expect(server.stats()).toMatchObject({ rooms: 0, connections: 0 });
+  });
+});
+
+describe("connection limit", () => {
+  it("turns away connections beyond the limit with 503, and accepts again once one leaves", async () => {
+    const server = startServer({ limits: { maxConnections: 2 } });
+    const first = await attemptConnect(server);
+    const second = await attemptConnect(server);
+    expect([first.opened, second.opened]).toEqual([true, true]);
+    expect(await attemptConnect(server)).toEqual({ opened: false, status: 503 });
+
+    if (first.opened) first.connection.socket.close();
+    await until(() => server.stats().connections === 1, "a connection to leave");
+    expect((await attemptConnect(server)).opened).toBe(true);
+  });
+});
+
+describe("heartbeat", () => {
+  it("keeps a connection that answers pings", async () => {
+    const server = startServer({ heartbeatIntervalMs: 20 });
+    const { socket } = await connect(server);
+    let pings = 0;
+    socket.on("ping", () => (pings += 1));
+    await until(() => pings >= 4, "four pings");
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("drops a connection that stops answering, and removes it from its room", async () => {
+    const server = startServer({ heartbeatIntervalMs: 20 });
+    const stayer = await joinFresh(server, "room1", "stayer");
+    await stayer.inbox.next("presence");
+
+    // A peer that is alive as far as TCP knows but never answers pings (a dead phone, a dropped route).
+    const silent = new WebSocket(`ws://localhost:${server.port}`, { autoPong: false });
+    sockets.push(silent);
+    silent.on("error", () => {});
+    await new Promise<void>((resolve) => silent.once("open", () => resolve()));
+    silent.send(
+      JSON.stringify({
+        type: "join_room",
+        protocolVersion: PROTOCOL_VERSION,
+        roomId: "room1",
+        clientId: "ghost",
+        sinceSeq: 0,
+      }),
+    );
+    const joined = await stayer.inbox.next("presence");
+    expect(joined.clients.map((c) => c.clientId).sort()).toEqual(["ghost", "stayer"]);
+
+    await waitForClose(silent);
+    const afterwards = await stayer.inbox.next("presence");
+    expect(afterwards.clients.map((c) => c.clientId)).toEqual(["stayer"]);
+  });
+
+  it("can be turned off", async () => {
+    const server = startServer({ heartbeatIntervalMs: 0 });
+    const { socket } = await connect(server);
+    let pings = 0;
+    socket.on("ping", () => (pings += 1));
+    send({ socket, inbox: new Inbox(socket) }, createShape("probe"));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(pings).toBe(0);
+  });
+});
+
+describe("rate limiting", () => {
+  it("lets a burst through, then refuses ops with a rate_limited reject and stores nothing more", async () => {
+    const clock = controllableClock();
+    const server = startServer({ now: clock.now, limits: { opsBurst: 3, opsPerSecond: 1 } });
+    const client = await joinFresh(server, "room1", "clientA");
+
+    for (let i = 1; i <= 5; i++) send(client, createShape(`s${i}`));
+    for (let i = 0; i < 3; i++) await client.inbox.next("op_ack");
+    const rejects = [await client.inbox.next("op_reject"), await client.inbox.next("op_reject")];
+    expect(rejects.map((r) => r.reason)).toEqual(["rate_limited", "rate_limited"]);
+    expect(rejects.map((r) => r.opId)).toEqual(["op-s4", "op-s5"]);
+    expect(server.opLog.latestSeq("room1")).toBe(3);
+  });
+
+  it("accepts ops again once the allowance has refilled", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { opsBurst: 1, opsPerSecond: 1, violationsBeforeClose: 1000 },
+    });
+    const client = await joinFresh(server, "room1", "clientA");
+
+    send(client, createShape("s1"));
+    await client.inbox.next("op_ack");
+    send(client, createShape("s2"));
+    expect((await client.inbox.next("op_reject")).reason).toBe("rate_limited");
+
+    clock.advance(1000);
+    send(client, createShape("s2", "room1", "op-s2-again"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(2);
+  });
+
+  it("limits each connection on its own", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { opsBurst: 1, opsPerSecond: 1, violationsBeforeClose: 1000 },
+    });
+    const noisy = await joinFresh(server, "room1", "noisy");
+    const calm = await joinFresh(server, "room1", "calm");
+
+    send(noisy, createShape("n1"));
+    send(noisy, createShape("n2"));
+    await noisy.inbox.next("op_reject");
+    send(calm, createShape("c1"));
+
+    // Acks go to the whole room, so calm also sees noisy's accepted op; its own must be accepted too.
+    const acked = [(await calm.inbox.next("op_ack")).op, (await calm.inbox.next("op_ack")).op].map(
+      (op) => op.shapeId,
+    );
+    expect(acked.sort()).toEqual(["c1", "n1"]);
+    expect(calm.inbox.pending("op_reject")).toBe(0);
+  });
+
+  it("drops excess cursor traffic without a reply, and keeps the allowed part flowing", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { ephemeralBurst: 2, ephemeralPerSecond: 1, violationsBeforeClose: 1000 },
+    });
+    const sender = await joinFresh(server, "room1", "sender");
+    const watcher = await joinFresh(server, "room1", "watcher");
+
+    for (let i = 0; i < 5; i++) {
+      send(sender, { type: "cursor", roomId: "room1", clientId: "x", x: i, y: i, color: "#fff" });
+    }
+    send(sender, createShape("probe"));
+    await watcher.inbox.next("op_ack"); // everything before it has been handled
+    expect(watcher.inbox.pending("cursor")).toBe(2);
+    expect(sender.inbox.pending("error")).toBe(0);
+    expect(sender.inbox.pending("op_reject")).toBe(0);
+  });
+
+  it("keeps ephemeral and op allowances separate: a flood of cursors does not block edits", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { ephemeralBurst: 1, ephemeralPerSecond: 1, violationsBeforeClose: 1000 },
+    });
+    const client = await joinFresh(server, "room1", "clientA");
+    for (let i = 0; i < 10; i++) {
+      send(client, { type: "cursor", roomId: "room1", clientId: "x", x: i, y: i, color: "#fff" });
+    }
+    send(client, createShape("s1"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+  });
+
+  it("limits drag previews the same way as cursors", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { ephemeralBurst: 2, ephemeralPerSecond: 1, violationsBeforeClose: 1000 },
+    });
+    const sender = await joinFresh(server, "room1", "sender");
+    const watcher = await joinFresh(server, "room1", "watcher");
+    send(sender, createShape("shape1"));
+    await watcher.inbox.next("op_ack");
+
+    for (let i = 0; i < 6; i++) {
+      send(sender, {
+        type: "drag_preview",
+        roomId: "room1",
+        clientId: "x",
+        shapeId: "shape1",
+        changes: { x: i },
+      });
+    }
+    send(sender, updateX("shape1", 9, "commit"));
+    await watcher.inbox.next("op_ack");
+    expect(watcher.inbox.pending("drag_preview")).toBe(2);
+  });
+
+  it("closes a connection that keeps breaking the rules, telling it why", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { opsBurst: 1, opsPerSecond: 1, violationsBeforeClose: 3 },
+    });
+    const client = await joinFresh(server, "room1", "clientA");
+    const closed = waitForClose(client.socket);
+
+    for (let i = 0; i < 10; i++) send(client, createShape(`s${i}`));
+    expect(await closed).toBe(CLOSE_POLICY_VIOLATION);
+    expect((await client.inbox.next("error")).code).toBe("rate_limited");
+    expect(server.opLog.latestSeq("room1")).toBe(1);
+  });
+
+  it("counts malformed frames as rule-breaking too, so garbage cannot flood the logs forever", async () => {
+    const clock = controllableClock();
+    const server = startServer({ now: clock.now, limits: { violationsBeforeClose: 3 } });
+    const client = await joinFresh(server, "room1", "clientA");
+    const closed = waitForClose(client.socket);
+
+    for (let i = 0; i < 8; i++) client.socket.send("{not json");
+    expect(await closed).toBe(CLOSE_POLICY_VIOLATION);
+  });
+
+  it("forgives occasional mistakes: the allowance recovers with time", async () => {
+    const clock = controllableClock();
+    const server = startServer({ now: clock.now, limits: { violationsBeforeClose: 3 } });
+    const client = await joinFresh(server, "room1", "clientA");
+
+    for (let round = 0; round < 3; round++) {
+      for (let i = 0; i < 3; i++) client.socket.send("{not json");
+      for (let i = 0; i < 3; i++) await client.inbox.next("error");
+      clock.advance(10_000);
+    }
+    send(client, createShape("s1"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+    expect(client.socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("ignores everything a connection sends after it has decided to close it, including cursors", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { opsBurst: 1, opsPerSecond: 1, violationsBeforeClose: 1 },
+    });
+    const offender = await joinFresh(server, "room1", "offender");
+    const watcher = await joinFresh(server, "room1", "watcher");
+    const closed = waitForClose(offender.socket);
+
+    // Enough over-limit ops to be cut off, then cursor frames in the same burst, which the
+    // (full) ephemeral allowance would happily relay if the connection were still being served.
+    for (let i = 0; i < 6; i++) send(offender, createShape(`s${i}`));
+    for (let i = 0; i < 5; i++) {
+      send(offender, { type: "cursor", roomId: "room1", clientId: "offender", x: i, y: i, color: "#fff" });
+    }
+    await closed;
+    await until(() => server.stats().connections === 1, "the offender to be gone");
+    expect(watcher.inbox.pending("cursor")).toBe(0);
+  });
+
+  it("stops handling frames from a connection it is closing", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      limits: { opsBurst: 1, opsPerSecond: 1, violationsBeforeClose: 1 },
+    });
+    const client = await joinFresh(server, "room1", "clientA");
+    const closed = waitForClose(client.socket);
+    for (let i = 0; i < 20; i++) send(client, createShape(`s${i}`));
+    await closed;
+    expect(server.opLog.latestSeq("room1")).toBe(1);
+  });
+});
+
+describe("capacity limits", () => {
+  it("refuses new shapes once a room is full, but still allows editing and deleting existing ones", async () => {
+    const server = startServer({ limits: { maxShapesPerRoom: 2 } });
+    const client = await joinFresh(server, "room1", "clientA");
+
+    send(client, createShape("s1"));
+    send(client, createShape("s2"));
+    await client.inbox.next("op_ack");
+    await client.inbox.next("op_ack");
+
+    send(client, createShape("s3"));
+    expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "op-s3", reason: "room_full" });
+
+    send(client, updateX("s1", 5, "move"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(3);
+    send(client, deleteShape("s2"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(4);
+  });
+
+  it("counts deleted shapes against the limit, since they stay as tombstones", async () => {
+    const server = startServer({ limits: { maxShapesPerRoom: 1 } });
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("s1"));
+    await client.inbox.next("op_ack");
+    send(client, deleteShape("s1"));
+    await client.inbox.next("op_ack");
+
+    send(client, createShape("s2"));
+    expect((await client.inbox.next("op_reject")).reason).toBe("room_full");
+  });
+
+  it("refuses every op once a room has stored its maximum", async () => {
+    const server = startServer({ limits: { maxOpsPerRoom: 2 } });
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("s1"));
+    send(client, updateX("s1", 1, "m1"));
+    await client.inbox.next("op_ack");
+    await client.inbox.next("op_ack");
+
+    send(client, updateX("s1", 2, "m2"));
+    send(client, deleteShape("s1"));
+    expect((await client.inbox.next("op_reject")).reason).toBe("room_full");
+    expect((await client.inbox.next("op_reject")).reason).toBe("room_full");
+    expect(server.opLog.latestSeq("room1")).toBe(2);
+  });
+
+  it("applies the per-room op limit to each room separately", async () => {
+    const server = startServer({ limits: { maxOpsPerRoom: 1 } });
+    const a = await joinFresh(server, "roomA", "clientA");
+    const b = await joinFresh(server, "roomB", "clientB");
+    send(a, createShape("s1", "roomA"));
+    send(b, createShape("s1", "roomB"));
+    expect((await a.inbox.next("op_ack")).seq).toBe(1);
+    expect((await b.inbox.next("op_ack")).seq).toBe(1);
+  });
+
+  it("refuses ops with server_full once the whole server has stored its maximum", async () => {
+    const server = startServer({ limits: { maxTotalOps: 3 } });
+    const a = await joinFresh(server, "roomA", "clientA");
+    const b = await joinFresh(server, "roomB", "clientB");
+    send(a, createShape("s1", "roomA"));
+    send(a, createShape("s2", "roomA"));
+    await a.inbox.next("op_ack");
+    await a.inbox.next("op_ack");
+    send(b, createShape("s1", "roomB"));
+    await b.inbox.next("op_ack");
+
+    send(b, createShape("s2", "roomB"));
+    expect((await b.inbox.next("op_reject")).reason).toBe("server_full");
+    send(a, createShape("s3", "roomA"));
+    expect((await a.inbox.next("op_reject")).reason).toBe("server_full");
+    expect(server.stats().totalOps).toBe(3);
+  });
+
+  it("still answers a retry of an op that is already stored when the room is full", async () => {
+    const server = startServer({ limits: { maxOpsPerRoom: 1 } });
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("s1", "room1", "the-op"));
+    const original = await client.inbox.next("op_ack");
+
+    send(client, createShape("s1", "room1", "the-op"));
+    expect(await client.inbox.next("op_ack")).toEqual(original);
+    expect(client.inbox.pending("op_reject")).toBe(0);
+  });
+
+  it("turns away a client when the room is full of people, and takes it once someone leaves", async () => {
+    const server = startServer({ limits: { maxClientsPerRoom: 2 } });
+    const first = await joinFresh(server, "room1", "a");
+    await joinFresh(server, "room1", "b");
+
+    const refused = await joinAndExpectClose(server, "room1", "c");
+    expect(refused.closeCode).toBe(CLOSE_TRY_AGAIN_LATER);
+    expect((await refused.connection.inbox.next("error")).code).toBe("room_full");
+    await until(() => server.stats().connections === 2, "the refused connection to be gone");
+
+    first.socket.close();
+    await until(() => server.stats().connections === 1, "someone to leave");
+    const retry = await joinFresh(server, "room1", "c");
+    expect((await retry.inbox.next("presence")).clients).toHaveLength(2);
+  });
+
+  it("turns away a join that would open one room too many, while existing rooms keep working", async () => {
+    const server = startServer({ limits: { maxRooms: 2 } });
+    await joinFresh(server, "r1", "a");
+    await joinFresh(server, "r2", "b");
+
+    const refused = await joinAndExpectClose(server, "r3", "c");
+    expect(refused.closeCode).toBe(CLOSE_TRY_AGAIN_LATER);
+    expect((await refused.connection.inbox.next("error")).code).toBe("server_busy");
+    expect((await joinFresh(server, "r1", "d")).socket.readyState).toBe(WebSocket.OPEN);
+  });
+
+  it("makes room again once idle rooms have been swept", async () => {
+    const clock = controllableClock();
+    const server = startServer({
+      now: clock.now,
+      roomIdleMs: 1000,
+      sweepIntervalMs: 0,
+      limits: { maxRooms: 1 },
+    });
+    const first = await joinFresh(server, "r1", "a");
+    first.socket.close();
+    await until(() => server.stats().connections === 0, "the client to leave");
+
+    expect((await joinAndExpectClose(server, "r2")).closeCode).toBe(CLOSE_TRY_AGAIN_LATER);
+    clock.advance(1000);
+    expect(server.sweepIdleRooms()).toBe(1);
+    expect((await joinFresh(server, "r2", "b")).socket.readyState).toBe(WebSocket.OPEN);
+  });
+});
+
+describe("room id policy", () => {
+  it("refuses a room id that is too short, finally", async () => {
+    const server = startServer({ minRoomIdLength: 22 });
+    const refused = await joinAndExpectClose(server, "demo");
+    expect(refused.closeCode).toBe(CLOSE_ROOM_REFUSED);
+    expect((await refused.connection.inbox.next("error")).code).toBe("invalid_room");
+    expect(server.stats().rooms).toBe(0); // it did not even create the room
+  });
+
+  it("accepts an id of exactly the minimum length", async () => {
+    const server = startServer({ minRoomIdLength: 22 });
+    const id = "a".repeat(22);
+    expect((await joinFresh(server, id, "a")).socket.readyState).toBe(WebSocket.OPEN);
+    expect((await joinAndExpectClose(server, "a".repeat(21))).closeCode).toBe(CLOSE_ROOM_REFUSED);
+  });
+
+  it("accepts any valid id when no minimum is set", async () => {
+    const server = startServer();
+    expect((await joinFresh(server, "x", "a")).socket.readyState).toBe(WebSocket.OPEN);
+  });
+});
+
+describe("idle rooms and snapshots", () => {
+  it("drops an empty room from memory after the idle time, then loads it back identically", async () => {
+    const clock = controllableClock();
+    const server = startServer({ now: clock.now, roomIdleMs: 1000, sweepIntervalMs: 0 });
+    const first = await joinFresh(server, "room1", "a");
+    send(first, createShape("s1"));
+    send(first, updateX("s1", 7, "move"));
+    send(first, createShape("s2"));
+    for (let i = 0; i < 3; i++) await first.inbox.next("op_ack");
+    first.socket.close();
+    await until(() => server.stats().connections === 0, "the client to leave");
+    expect(server.stats().rooms).toBe(1);
+
+    clock.advance(999);
+    expect(server.sweepIdleRooms()).toBe(0);
+    clock.advance(1);
+    expect(server.sweepIdleRooms()).toBe(1);
+    expect(server.stats().rooms).toBe(0);
+    expect(server.opLog.loadSnapshot("room1")?.seq).toBe(3); // saved on the way out
+
+    const returning = await joinRoom(server, "room1", "b");
+    const snapshot = await returning.inbox.next("sync_snapshot");
+    expect(snapshot.latestSeq).toBe(3);
+    expect(Object.keys(snapshot.shapes)).toEqual(["s1", "s2"]);
+    expect(snapshot.shapes.s1?.x).toBe(7);
+  });
+
+  it("never drops a room while someone is in it", async () => {
+    const clock = controllableClock();
+    const server = startServer({ now: clock.now, roomIdleMs: 1000, sweepIntervalMs: 0 });
+    await joinFresh(server, "room1", "a");
+    clock.advance(10_000_000);
+    expect(server.sweepIdleRooms()).toBe(0);
+    expect(server.stats().rooms).toBe(1);
+  });
+
+  it("sweeps on its own schedule when one is configured", async () => {
+    const server = startServer({ roomIdleMs: 1, sweepIntervalMs: 10 });
+    const client = await joinFresh(server, "room1", "a");
+    client.socket.close();
+    await until(() => server.stats().rooms === 0, "the room to be swept");
+  });
+
+  it("saves a snapshot every N ops", async () => {
+    const server = startServer({ snapshotEvery: 3 });
+    const client = await joinFresh(server, "room1", "a");
+    send(client, createShape("s1"));
+    send(client, createShape("s2"));
+    await client.inbox.next("op_ack");
+    await client.inbox.next("op_ack");
+    expect(server.opLog.loadSnapshot("room1")).toBeNull();
+
+    send(client, createShape("s3"));
+    await client.inbox.next("op_ack");
+    const snapshot = server.opLog.loadSnapshot("room1");
+    expect(snapshot?.seq).toBe(3);
+    expect(Object.keys(snapshot?.state ?? {})).toEqual(["s1", "s2", "s3"]); // includes the op that triggered it
+  });
+
+  it("restarts from the saved snapshot: state survives a server restart exactly", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "canvas-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "ops.sqlite");
+
+    const first = startServer({ dbPath, snapshotEvery: 2 });
+    const writer = await joinFresh(first, "room1", "a");
+    send(writer, createShape("s1"));
+    send(writer, updateX("s1", 5, "m1"));
+    send(writer, createShape("s2"));
+    send(writer, deleteShape("s2"));
+    for (let i = 0; i < 4; i++) await writer.inbox.next("op_ack");
+    await first.close();
+
+    const check = new OpLog(dbPath);
+    expect(check.loadSnapshot("room1")?.seq).toBe(4); // written at shutdown
+    check.close();
+
+    const second = startServer({ dbPath });
+    const reader = await joinRoom(second, "room1", "b");
+    const snapshot = await reader.inbox.next("sync_snapshot");
+    expect(snapshot.latestSeq).toBe(4);
+    expect(snapshot.shapes.s1?.x).toBe(5);
+    expect(snapshot.shapes.s2?.deletedAt).toBeDefined();
+    expect(liveShapes(snapshot.shapes)).toEqual({ s1: expect.objectContaining({ x: 5 }) });
+  });
+
+  it("saves a snapshot of every room on shutdown, even one that never reached the snapshot interval", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "canvas-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "ops.sqlite");
+
+    const server = startServer({ dbPath }); // default interval: 500 ops
+    const writer = await joinFresh(server, "room1", "a");
+    send(writer, createShape("s1"));
+    send(writer, createShape("s2"));
+    await writer.inbox.next("op_ack");
+    await writer.inbox.next("op_ack");
+    expect(server.opLog.loadSnapshot("room1")).toBeNull(); // nothing yet: only 2 ops
+
+    await server.close();
+    const check = new OpLog(dbPath);
+    expect(check.loadSnapshot("room1")?.seq).toBe(2);
+    check.close();
+  });
+
+  it("recovers by replaying the log when the saved snapshot is damaged", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "canvas-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "ops.sqlite");
+
+    const first = startServer({ dbPath });
+    const writer = await joinFresh(first, "room1", "a");
+    send(writer, createShape("s1"));
+    await writer.inbox.next("op_ack");
+    await first.close();
+
+    const tamper = new OpLog(dbPath);
+    tamper.saveSnapshot("room1", 1, {});
+    tamper.close();
+    // Break the stored JSON itself, as disk corruption might.
+    const Database = (await import("better-sqlite3")).default;
+    const raw = new Database(dbPath);
+    raw.prepare("UPDATE snapshots SET state_json = '{broken' WHERE room_id = 'room1'").run();
+    raw.close();
+
+    const logger = quietLogger();
+    const second = startServer({ dbPath, logger });
+    const reader = await joinRoom(second, "room1", "b");
+    const snapshot = await reader.inbox.next("sync_snapshot");
+    expect(Object.keys(snapshot.shapes)).toEqual(["s1"]);
+    expect(logger.warn).toHaveBeenCalled();
+  });
+});
+
+describe("join deadline", () => {
+  it("closes a connection that never joins a room, and says why", async () => {
+    const logger = quietLogger();
+    const server = startServer({ joinTimeoutMs: 40, logger });
+    const idle = await connect(server);
+    const closed = waitForClose(idle.socket);
+    expect(await closed).toBe(CLOSE_POLICY_VIOLATION);
+    expect((await idle.inbox.next("error")).code).toBe("not_joined");
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it("leaves a connection alone once it has joined", async () => {
+    const server = startServer({ joinTimeoutMs: 40 });
+    const client = await joinFresh(server, "room1", "a");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(client.socket.readyState).toBe(WebSocket.OPEN);
+    send(client, createShape("s1"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+  });
+
+  it("frees the slot for someone else", async () => {
+    const server = startServer({ joinTimeoutMs: 40, limits: { maxConnections: 1 } });
+    const idle = await connect(server);
+    expect((await attemptConnect(server)).opened).toBe(false); // the only slot is taken
+    await waitForClose(idle.socket);
+    await until(() => server.stats().connections === 0, "the slot to be freed");
+    expect((await attemptConnect(server)).opened).toBe(true);
+  });
+
+  it("can be turned off", async () => {
+    const server = startServer({ joinTimeoutMs: 0 });
+    const idle = await connect(server);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(idle.socket.readyState).toBe(WebSocket.OPEN);
+  });
+});
+
+describe("shutting down with people connected", () => {
+  it("closes every connection and finishes, even with a health check connection held open", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "a");
+    const closed = waitForClose(client.socket);
+    const keepAlive = await healthOf(server, { headers: { Connection: "keep-alive" } });
+    expect(keepAlive.status).toBe(200);
+
+    await server.close();
+    await closed;
+    expect(client.socket.readyState).toBe(WebSocket.CLOSED);
   });
 });

@@ -20,7 +20,8 @@ export default defineConfig({
     {
       // The real server, built by `npm run build`, with an in-memory database.
       command: "node ../server/dist/index.js",
-      env: { PORT: String(SERVER_PORT), DB_PATH: ":memory:" },
+      // A small shape limit, so the "board is full" experience can be tested without drawing thousands of shapes.
+      env: { PORT: String(SERVER_PORT), DB_PATH: ":memory:", MAX_SHAPES_PER_ROOM: "25" },
       port: SERVER_PORT,
       reuseExistingServer: !process.env.CI,
     },

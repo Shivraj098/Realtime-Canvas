@@ -1,6 +1,6 @@
 import WebSocket from "ws";
 import { applyOps, type RoomState, type ShapeChanges, type ShapeFields } from "@realtime-canvas/shared";
-import { createServer, type ServerHandle } from "@realtime-canvas/server";
+import { createServer, type ServerHandle, type ServerOptions } from "@realtime-canvas/server";
 import { RoomClient, type RoomClientEvent } from "../room-client";
 import type { LocalResult } from "../sync/sync-engine";
 import type { WebSocketConstructor } from "../net/types";
@@ -65,9 +65,10 @@ export class Harness {
 
   private constructor(readonly server: ServerHandle) {}
 
-  static start(): Harness {
+  /** Starts a real server on a free port. `options` override its defaults, for tests of limits. */
+  static start(options: Partial<ServerOptions> = {}): Harness {
     const quiet = { info: () => {}, warn: () => {}, error: () => {} };
-    return new Harness(createServer({ port: 0, dbPath: ":memory:", logger: quiet }));
+    return new Harness(createServer({ port: 0, dbPath: ":memory:", logger: quiet, ...options }));
   }
 
   get opLog() {
@@ -87,6 +88,9 @@ export class Harness {
       WebSocket: WebSocketCtor,
       // Real timers, scaled down so a reconnect takes milliseconds, not seconds.
       backoff: { baseMs: 2, maxMs: 20, jitter: 0.3 },
+      flushBatchSize: 50,
+      flushIntervalMs: 5,
+      retryDelayMs: 20,
       ...(options.protocolVersion !== undefined && { protocolVersion: options.protocolVersion }),
     });
     const testClient = new TestClient(name, client, net);

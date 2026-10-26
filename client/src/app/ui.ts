@@ -1,4 +1,4 @@
-import type { RoomClient } from "../room-client";
+import type { RoomClient, RoomClientEvent } from "../room-client";
 import type { SocketStatus } from "../net/room-socket";
 import type { RemotePreview } from "../sync/sync-engine";
 import { labelFor } from "./scene";
@@ -12,7 +12,48 @@ export const STATUS_TEXT: Record<SocketStatus, string> = {
   waiting: "Reconnecting…",
   closed: "Offline",
   unsupported_protocol: "Out of date: reload the page",
+  refused: "This room link is not allowed",
 };
+
+/**
+ * A short message for something the person should know about, or null when
+ * nothing needs saying (most rejections just roll an edit back, which is
+ * already visible). Kept as plain data so the wording is testable.
+ */
+export function noticeFor(event: RoomClientEvent): string | null {
+  switch (event.type) {
+    case "op_rejected":
+      switch (event.reason) {
+        case "rate_limited":
+          return "You are making changes very fast. They will go through in a moment.";
+        case "room_full":
+          return "This board is full: no more shapes or changes can be added.";
+        case "server_full":
+          return "The server is full right now, so that change was not saved.";
+        case "unknown_shape":
+          return "Someone else removed that shape.";
+        default:
+          return null;
+      }
+    case "server_error":
+      switch (event.code) {
+        case "room_full":
+          return "This room is full. Trying again shortly…";
+        case "server_busy":
+          return "The server is busy. Trying again shortly…";
+        case "rate_limited":
+          return "Too many messages: the connection was closed. Reconnecting…";
+        case "invalid_room":
+          return "This room link is not allowed.";
+        default:
+          return null;
+      }
+    case "resync_requested":
+      return null;
+  }
+}
+
+const NOTICE_VISIBLE_MS = 6000;
 
 function element<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -60,6 +101,7 @@ export function mountUi(client: RoomClient, state: AppState, onDelete: () => voi
   const presence = element<HTMLUListElement>("presence");
   const shapeList = element<HTMLUListElement>("shape-list");
   const copyButton = element<HTMLButtonElement>("copy-link");
+  const notice = element("notice");
 
   const cleanups: (() => void)[] = [];
   const listen = <T extends EventTarget>(target: T, type: string, handler: EventListener): void => {
@@ -184,6 +226,20 @@ export function mountUi(client: RoomClient, state: AppState, onDelete: () => voi
     scheduled = true;
     requestAnimationFrame(render);
   }
+
+  // Notices: shown briefly, and replaced by the next one.
+  let hideNotice: number | undefined;
+  cleanups.push(
+    client.onEvent((event) => {
+      const text = noticeFor(event);
+      if (!text) return;
+      notice.textContent = text;
+      notice.hidden = false;
+      window.clearTimeout(hideNotice);
+      hideNotice = window.setTimeout(() => (notice.hidden = true), NOTICE_VISIBLE_MS);
+    }),
+  );
+  cleanups.push(() => window.clearTimeout(hideNotice));
 
   cleanups.push(client.subscribe(scheduleRender));
   cleanups.push(state.subscribe(scheduleRender));

@@ -63,6 +63,13 @@ On every (re)connection, in this order:
 `RoomClient.retryNow()` cuts a backoff wait short. The canvas app calls it when the
 browser fires `online` and when the tab becomes visible; it does nothing on a healthy connection.
 
+The catch-up is **paced**: ops are re-sent 10 at a time, 600 ms apart (below the
+server's default allowance of 20 ops a second), and strictly in their original order.
+A new edit made while older ones are still waiting joins the back of the line, so an
+update can never reach the server before the create it depends on. If the server
+still answers `rate_limited`, the engine KEEPS the op (it is not a verdict on the op)
+and the client sends it again after a pause.
+
 If the engine reports a gap in the op stream, the client reconnects (after the
 normal backoff) and resumes from `lastSeq`.
 
@@ -87,8 +94,13 @@ normal backoff) and resumes from `lastSeq`.
 
 ## Known limits
 
-- No heartbeat yet: a connection that dies silently is noticed only when the OS
-  or a proxy closes it (Phase 5a adds ping/pong).
+- A connection that dies silently is detected by the SERVER's ping/pong, which drops
+  it; the client itself cannot see pings (browsers answer them invisibly), so it
+  learns of a dead link when the socket closes.
+- If the server refuses ops as too fast while later, dependent ops are already in
+  flight, those later ops can be refused for good (`unknown_shape`). The paced
+  catch-up keeps a normal client well below the limit, so this needs a scripted
+  burst to happen.
 - Cursor and drag-preview throttling is left to the UI, which knows its frame loop.
 - A server-side failure while storing an op gives no reject: the op simply stays
   pending and is re-sent on the next reconnect.

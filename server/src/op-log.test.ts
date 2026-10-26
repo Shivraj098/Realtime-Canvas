@@ -163,3 +163,99 @@ describe("OpLog durability", () => {
     reopened.close();
   });
 });
+
+describe("OpLog snapshots", () => {
+  const state = {
+    s1: { x: 1, y: 2, width: 3, height: 4, color: "#fff", lastHlc: {} },
+  } as unknown as import("@realtime-canvas/shared").RoomState;
+
+  it("has no snapshot until one is saved", () => {
+    const log = new OpLog(":memory:");
+    expect(log.loadSnapshot("room1")).toBeNull();
+    log.close();
+  });
+
+  it("returns what was saved", () => {
+    const log = new OpLog(":memory:");
+    log.saveSnapshot("room1", 12, state);
+    expect(log.loadSnapshot("room1")).toEqual({ seq: 12, state });
+    log.close();
+  });
+
+  it("keeps only the newest snapshot of a room", () => {
+    const log = new OpLog(":memory:");
+    log.saveSnapshot("room1", 5, {});
+    log.saveSnapshot("room1", 9, state);
+    expect(log.loadSnapshot("room1")).toEqual({ seq: 9, state });
+    log.close();
+  });
+
+  it("keeps rooms apart", () => {
+    const log = new OpLog(":memory:");
+    log.saveSnapshot("a", 1, state);
+    expect(log.loadSnapshot("b")).toBeNull();
+    log.close();
+  });
+
+  it("survives close and reopen", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oplog-"));
+    try {
+      const path = join(dir, "ops.sqlite");
+      const first = new OpLog(path);
+      first.saveSnapshot("room1", 3, state);
+      first.close();
+      const second = new OpLog(path);
+      expect(second.loadSnapshot("room1")).toEqual({ seq: 3, state });
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("OpLog.totalOps", () => {
+  it("counts every stored op across rooms", () => {
+    const log = new OpLog(":memory:");
+    expect(log.totalOps()).toBe(0);
+    log.append("a", makeOp("s1", 100, "o1"));
+    log.append("a", makeOp("s2", 101, "o2"));
+    log.append("b", makeOp("s1", 102, "o3"));
+    expect(log.totalOps()).toBe(3);
+    log.close();
+  });
+
+  it("does not count a duplicate", () => {
+    const log = new OpLog(":memory:");
+    log.append("a", makeOp("s1", 100, "same"));
+    log.append("a", makeOp("s1", 999, "same"));
+    expect(log.totalOps()).toBe(1);
+    log.close();
+  });
+
+  it("is restored from the database when it is reopened", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oplog-"));
+    try {
+      const path = join(dir, "ops.sqlite");
+      const first = new OpLog(path);
+      first.append("a", makeOp("s1", 100, "o1"));
+      first.append("a", makeOp("s2", 101, "o2"));
+      first.close();
+      const second = new OpLog(path);
+      expect(second.totalOps()).toBe(2);
+      second.append("a", makeOp("s3", 102, "o3"));
+      expect(second.totalOps()).toBe(3);
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("OpLog.ping", () => {
+  it("succeeds on a working database and throws once it is closed", () => {
+    const log = new OpLog(":memory:");
+    expect(() => log.ping()).not.toThrow();
+    log.close();
+    expect(() => log.ping()).toThrow();
+  });
+});

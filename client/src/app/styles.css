@@ -206,6 +206,7 @@ button {
 }
 
 .status[data-status="closed"] .dot,
+.status[data-status="refused"] .dot,
 .status[data-status="unsupported_protocol"] .dot {
   background: var(--bad);
 }
@@ -249,6 +250,27 @@ button {
   max-width: calc(100vw - 24px);
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.notice {
+  position: fixed;
+  left: 50%;
+  bottom: calc(max(14px, env(safe-area-inset-bottom)) + 40px);
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 8px 16px;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--warn);
+  box-shadow: var(--surface-shadow);
+  color: var(--text);
+  font-size: 13px;
+  max-width: calc(100vw - 24px);
+  text-align: center;
+}
+
+.notice[hidden] {
+  display: none;
 }
 
 .sr-only {

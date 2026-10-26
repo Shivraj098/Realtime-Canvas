@@ -1,7 +1,10 @@
 import Database from "better-sqlite3";
-import type { Op } from "@realtime-canvas/shared";
+import type { Op, RoomState } from "@realtime-canvas/shared";
 
 export type StoredOp = { seq: number; op: Op };
+
+/** A room's materialized state as of op `seq`, saved so a room can be loaded without replaying its whole log. */
+export type StoredSnapshot = { seq: number; state: RoomState };
 
 /** `duplicate` carries the op as originally stored, so a retry can be answered with its real sequence number. */
 export type AppendResult = { status: "appended"; seq: number } | ({ status: "duplicate" } & StoredOp);
@@ -24,6 +27,11 @@ export type AppendResult = { status: "appended"; seq: number } | ({ status: "dup
  * overwrite a newer edit from someone else. The UNIQUE (room_id, op_id)
  * constraint makes the retry a no-op, and the stored row lets the server
  * tell the retrying client which sequence number its op already has.
+ *
+ * Alongside the log, a `snapshots` table keeps one saved state per room.
+ * It is a cache, never the truth: the log is never trimmed, and a missing
+ * or unreadable snapshot just means the room is rebuilt from the whole log.
+ * With one, loading a room replays only the ops after the snapshot.
  */
 export class OpLog {
   private readonly db: Database.Database;
@@ -31,6 +39,9 @@ export class OpLog {
   private readonly findByOpIdStmt: Database.Statement;
   private readonly selectSinceStmt: Database.Statement;
   private readonly maxSeqStmt: Database.Statement;
+  private readonly saveSnapshotStmt: Database.Statement;
+  private readonly loadSnapshotStmt: Database.Statement;
+  private total: number;
   private readonly appendTx: (roomId: string, op: Op) => AppendResult;
 
   constructor(path: string) {
@@ -45,6 +56,11 @@ export class OpLog {
         PRIMARY KEY (room_id, seq),
         UNIQUE (room_id, op_id)
       );
+      CREATE TABLE IF NOT EXISTS snapshots (
+        room_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        state_json TEXT NOT NULL
+      );
     `);
 
     this.insertStmt = this.db.prepare(
@@ -57,6 +73,13 @@ export class OpLog {
       `SELECT seq, op_json FROM ops WHERE room_id = @roomId AND seq > @sinceSeq ORDER BY seq ASC`,
     );
     this.maxSeqStmt = this.db.prepare(`SELECT MAX(seq) AS maxSeq FROM ops WHERE room_id = @roomId`);
+    this.saveSnapshotStmt = this.db.prepare(
+      `INSERT OR REPLACE INTO snapshots (room_id, seq, state_json) VALUES (@roomId, @seq, @stateJson)`,
+    );
+    this.loadSnapshotStmt = this.db.prepare(`SELECT seq, state_json FROM snapshots WHERE room_id = @roomId`);
+    // Counted once at startup, then kept in step by append(): the global cap
+    // is checked on every op, and COUNT(*) on a large table is not free.
+    this.total = (this.db.prepare(`SELECT COUNT(*) AS n FROM ops`).get() as { n: number }).n;
 
     // Check-for-duplicate, read the next seq, and insert as one atomic
     // unit, so the sequence can never be handed out twice.
@@ -69,6 +92,16 @@ export class OpLog {
       this.insertStmt.run({ roomId, seq, opId: op.opId, opJson: JSON.stringify(op) });
       return { status: "appended", seq };
     });
+  }
+
+  /** Ops stored across every room. */
+  totalOps(): number {
+    return this.total;
+  }
+
+  /** Throws if the database cannot be read. For health checks. */
+  ping(): void {
+    this.db.prepare(`SELECT 1`).get();
   }
 
   /** Highest sequence number in the room, or 0 if it has no ops yet. */
@@ -89,7 +122,20 @@ export class OpLog {
    * appended to the room.
    */
   append(roomId: string, op: Op): AppendResult {
-    return this.appendTx(roomId, op);
+    const result = this.appendTx(roomId, op);
+    if (result.status === "appended") this.total += 1;
+    return result;
+  }
+
+  /** Saves the room's state as of `seq`, replacing any earlier snapshot. */
+  saveSnapshot(roomId: string, seq: number, state: RoomState): void {
+    this.saveSnapshotStmt.run({ roomId, seq, stateJson: JSON.stringify(state) });
+  }
+
+  /** The room's saved snapshot, or null if it has none. Throws if the stored JSON is unreadable. */
+  loadSnapshot(roomId: string): StoredSnapshot | null {
+    const row = this.loadSnapshotStmt.get({ roomId }) as { seq: number; state_json: string } | undefined;
+    return row ? { seq: row.seq, state: JSON.parse(row.state_json) as RoomState } : null;
   }
 
   /** All ops after `sinceSeq`, in order - what a reconnecting client needs to catch up. */

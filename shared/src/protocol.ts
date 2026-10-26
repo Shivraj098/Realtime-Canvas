@@ -23,10 +23,19 @@ import type { HlcTimestamp } from "./hlc";
  * a tab left open across a deploy fails loudly instead of misbehaving.
  * Bump it on any change an older peer could not understand.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** WebSocket close code the server uses after refusing an unsupported protocol version. A client must not auto-reconnect on it: retrying cannot succeed until the client is updated. */
 export const CLOSE_UNSUPPORTED_PROTOCOL = 4001;
+
+/** Close code after the server refused the room itself (for example an id that is too short). Final: retrying the same room cannot succeed. */
+export const CLOSE_ROOM_REFUSED = 4003;
+
+/** Standard close code for a connection that sent too much, too fast. */
+export const CLOSE_POLICY_VIOLATION = 1008;
+
+/** Standard close code for "full right now, try again later" (room or server at capacity). */
+export const CLOSE_TRY_AGAIN_LATER = 1013;
 
 export type ShapeFields = {
   x: number;
@@ -141,7 +150,17 @@ export type OpRejectReason =
   /** `create_shape` for a shapeId that exists or was deleted (ids are never reused). */
   | "shape_exists"
   /** `update_shape` / `delete_shape` for a shape that does not exist or is deleted. */
-  | "unknown_shape";
+  | "unknown_shape"
+  /**
+   * The connection is sending ops faster than the server allows. Unlike every
+   * other reason this one is TRANSIENT: nothing is wrong with the op, so the
+   * client should keep it queued and send it again after a short wait.
+   */
+  | "rate_limited"
+  /** The room has reached its limit on shapes or on stored ops. Waiting will not help. */
+  | "room_full"
+  /** The server as a whole has reached its limit on stored ops. Waiting will not help soon. */
+  | "server_full";
 
 /**
  * Server -> client: this specific op was refused and nothing was stored.
@@ -155,7 +174,19 @@ export type OpReject = {
   reason: OpRejectReason;
 };
 
-export type ErrorCode = "invalid_message" | "not_joined" | "already_joined" | "unsupported_protocol";
+export type ErrorCode =
+  | "invalid_message"
+  | "not_joined"
+  | "already_joined"
+  | "unsupported_protocol"
+  /** Too many people are in this room. The server closes with `CLOSE_TRY_AGAIN_LATER`. */
+  | "room_full"
+  /** The server is at capacity (too many rooms or connections). Closes with `CLOSE_TRY_AGAIN_LATER`. */
+  | "server_busy"
+  /** The connection flooded the server and is being closed with `CLOSE_POLICY_VIOLATION`. */
+  | "rate_limited"
+  /** The server does not accept this room id. Closes with `CLOSE_ROOM_REFUSED`; do not retry. */
+  | "invalid_room";
 
 /** Server -> client: a problem with the connection or a non-op message. Nothing was stored. */
 export type ProtocolError = {

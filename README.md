@@ -41,7 +41,9 @@ checkpoint.
 - [x] **Phase 3 — Client core**: connection handling, local state store
 - [x] **Phase 4 — Client canvas**: shape rendering, drag/create/delete,
       live cursors
-- [ ] **Phase 5 — Deployment**: Dockerized server on Fly.io, static
+- [x] **Phase 5a — Hardening**: health check, heartbeat, origin allowlist,
+      rate limits, capacity caps, idle-room eviction and snapshots
+- [ ] **Phase 5b — Deployment**: Dockerized server on Fly.io, static
       client on Vercel
 
 ## Development

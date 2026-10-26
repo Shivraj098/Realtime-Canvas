@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { CLOSE_UNSUPPORTED_PROTOCOL, type ServerMessage } from "@realtime-canvas/shared";
+import { CLOSE_ROOM_REFUSED, CLOSE_UNSUPPORTED_PROTOCOL, type ServerMessage } from "@realtime-canvas/shared";
 import { FakeScheduler, FakeWebSocket } from "../test-support/fake-websocket";
 import { backoffDelay, DEFAULT_BACKOFF, RoomSocket, type SocketStatus } from "./room-socket";
 
@@ -140,6 +140,23 @@ describe("reconnecting", () => {
     expect(handlers.onClose).toHaveBeenCalledTimes(1);
 
     socket.start(); // after an update, a manual start works again
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it("does not reconnect, and says why, when the server refuses the room itself", () => {
+    const { socket, scheduler, handlers } = setup();
+    socket.start();
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.serverClose(CLOSE_ROOM_REFUSED);
+
+    expect(socket.getStatus()).toBe("refused");
+    expect(scheduler.pendingDelays).toEqual([]);
+    expect(handlers.onClose).toHaveBeenCalledTimes(1);
+    socket.reconnectLater(); // no way back from a refusal
+    socket.retryNow();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    socket.start(); // unless asked again on purpose
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
 

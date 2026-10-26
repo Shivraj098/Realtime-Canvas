@@ -72,12 +72,21 @@ announced (`aria-live`), and a visually hidden list mirrors every shape on the
 board. The canvas itself cannot be read by a screen reader, so that list is the
 accessible view of it. The same list is what the browser tests read.
 
+## Telling people what happened
+
+Most refused edits just roll back, which is already visible. A few situations deserve
+a sentence, shown briefly at the bottom of the page and announced to screen readers:
+a board that is full, a server at capacity, editing so fast that changes are queued,
+and a shape someone else removed. The wording lives in `noticeFor` as plain data so
+it is tested. A room link the server will not accept shows as a status ("This room
+link is not allowed") rather than retrying forever.
+
 ## Testing
 
-| Layer   | What                                                                                                                                                                                                                                     |
-| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unit    | Geometry, the interaction state machine, scene building, rendering calls, smoothing, throttling.                                                                                                                                         |
-| Browser | Playwright drives two real Chromium browsers against the real server: drawing, moving with a live preview, resizing, recolouring, deleting, presence, cursors, two tabs, offline edits delivered on reconnect, sharpness on a 2x screen. |
+| Layer   | What                                                                                                                                                                                                                                                                    |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unit    | Geometry, the interaction state machine, scene building, rendering calls, smoothing, throttling.                                                                                                                                                                        |
+| Browser | Playwright drives two real Chromium browsers against the real server: drawing, moving with a live preview, resizing, recolouring, deleting, presence, cursors, two tabs, offline edits delivered on reconnect, a full board reporting itself, sharpness on a 2x screen. |
 
 Run them with `npm run e2e` (builds first). In CI they run as a separate
 workflow so the fast checks are not held up by browsers.

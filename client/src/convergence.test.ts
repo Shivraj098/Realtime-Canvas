@@ -60,6 +60,27 @@ function expectConverged(h: Harness): void {
   }
 }
 
+/**
+ * Like `expectConverged`, but for runs where the server asked for retries. An op
+ * refused as "too fast" and accepted on a retry is both rejected (once or more)
+ * and applied, which `expectConverged` forbids for ops refused for good.
+ */
+function expectConvergedAllowingRetries(h: Harness): void {
+  const log = h.opLog.since(ROOM, 0);
+  const truth = applyOps(
+    {},
+    log.map((stored) => stored.op),
+  );
+  const loggedIds = new Set(log.map((stored) => stored.op.opId));
+  expect(loggedIds.size).toBe(log.length);
+  for (const c of h.clients) {
+    expect(c.engine.getConfirmed(), `${c.name} confirmed state`).toEqual(truth);
+    expect(c.engine.getPending(), `${c.name} pending`).toEqual([]);
+    expect(c.engine.getLastSeq()).toBe(log.length);
+    for (const opId of c.issued) expect(loggedIds.has(opId), `${c.name}'s op ${opId} was lost`).toBe(true);
+  }
+}
+
 function created(c: TestClient, fields = {}, shapeId?: string): string {
   const result = c.create(fields, shapeId);
   if (!result.ok) throw new Error(`create failed: ${result.reason}`);
@@ -278,6 +299,51 @@ describe("connection trouble", () => {
 
     h.addClient("late");
     await h.settle();
+    expectConverged(h);
+  });
+});
+
+describe("a server that limits what it will accept", () => {
+  it("gets a long offline queue through a rate limit without losing or doubling anything", async () => {
+    // Ten ops at once, then 200 a second: far below what the client's catch-up sends in its first burst.
+    const h = (harness = Harness.start({
+      limits: { opsBurst: 10, opsPerSecond: 200, violationsBeforeClose: 100_000 },
+    }));
+    const alice = h.addClient("alice", { connect: false });
+    for (let i = 0; i < 100; i++) created(alice);
+    expect(alice.engine.getPending()).toHaveLength(100);
+
+    alice.client.connect();
+    await h.settle();
+
+    expect(h.opLog.latestSeq(ROOM)).toBe(100);
+    // The server really did push back, and the client treated that as "wait", not as "give up".
+    const slowedDown = alice.events.filter((e) => e.type === "op_rejected" && e.reason === "rate_limited");
+    expect(slowedDown.length).toBeGreaterThan(0);
+    expect(slowedDown.every((e) => e.type === "op_rejected" && e.retryable)).toBe(true);
+    expect(alice.rejectedOpIds.length).toBeGreaterThan(0);
+    expectConvergedAllowingRetries(h);
+  });
+
+  it("refuses shapes beyond a room's limit, rolls them back, and keeps everyone in agreement", async () => {
+    const h = (harness = Harness.start({ limits: { maxShapesPerRoom: 3 } }));
+    const alice = h.addClient("alice");
+    const bob = h.addClient("bob");
+    await h.waitUntil(
+      () => alice.client.getStatus() === "open" && bob.client.getStatus() === "open",
+      "both online",
+    );
+
+    for (let i = 0; i < 5; i++) created(i % 2 === 0 ? alice : bob);
+    await h.settle();
+
+    expect(Object.keys(alice.engine.getLiveShapes())).toHaveLength(3);
+    expect(Object.keys(bob.engine.getLiveShapes())).toHaveLength(3);
+    const refused = [...alice.events, ...bob.events].filter(
+      (e) => e.type === "op_rejected" && e.reason === "room_full",
+    );
+    expect(refused).toHaveLength(2);
+    expect(refused.every((e) => e.type === "op_rejected" && !e.retryable)).toBe(true);
     expectConverged(h);
   });
 });

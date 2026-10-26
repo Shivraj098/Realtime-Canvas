@@ -42,6 +42,19 @@ describe("parseServerMessage: accepts every well-formed server message", () => {
   });
 });
 
+describe("parseServerMessage: the limit-related reasons and codes", () => {
+  it.each(["rate_limited", "room_full", "server_full"])("accepts an op_reject for %s", (reason) => {
+    expect(parseServerMessage(JSON.stringify({ type: "op_reject", opId: "o1", reason }))).not.toBeNull();
+  });
+
+  it.each(["room_full", "server_busy", "rate_limited", "invalid_room"])(
+    "accepts an error with code %s",
+    (code) => {
+      expect(parseServerMessage(JSON.stringify({ type: "error", code, message: "m" }))).not.toBeNull();
+    },
+  );
+});
+
 describe("parseServerMessage: rejects anything else", () => {
   it.each([
     ["not JSON", "{nope"],

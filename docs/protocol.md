@@ -6,7 +6,7 @@ sides; the server validates every inbound frame against a matching `zod`
 schema in [`server/src/validation.ts`](../server/src/validation.ts).
 
 **Transport:** one WebSocket per client, JSON text frames only. A binary frame
-is dropped. **Version:** `PROTOCOL_VERSION` (currently `1`), sent in
+is dropped. **Version:** `PROTOCOL_VERSION` (currently `2`), sent in
 `join_room`.
 
 ## Two kinds of traffic
@@ -45,18 +45,46 @@ timestamp.
 
 ### `op_reject` reasons
 
-| Reason          | Cause                                                                           |
-| --------------- | ------------------------------------------------------------------------------- |
-| `invalid`       | The op failed validation.                                                       |
-| `not_joined`    | Sent before `join_room`.                                                        |
-| `shape_exists`  | `create_shape` for an id that exists or was ever deleted. Ids are never reused. |
-| `unknown_shape` | `update_shape` / `delete_shape` for a shape that does not exist or is deleted.  |
+| Reason          | Cause                                                                                                                                   |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid`       | The op failed validation.                                                                                                               |
+| `not_joined`    | Sent before `join_room`.                                                                                                                |
+| `shape_exists`  | `create_shape` for an id that exists or was ever deleted. Ids are never reused.                                                         |
+| `unknown_shape` | `update_shape` / `delete_shape` for a shape that does not exist or is deleted.                                                          |
+| `rate_limited`  | The connection is sending ops faster than the server allows. **Transient: the op is fine, so keep it and send it again after a pause.** |
+| `room_full`     | The room has reached its limit on shapes (deleted ones count) or on stored ops.                                                         |
+| `server_full`   | The server as a whole has reached its limit on stored ops.                                                                              |
 
 ### `error` codes
 
-`invalid_message`, `not_joined`, `already_joined`, `unsupported_protocol`. After
-`unsupported_protocol` the server closes the socket with code **4001**; a client
-must not auto-reconnect on it.
+| Code                   | Meaning                                                              | Then the server closes with |
+| ---------------------- | -------------------------------------------------------------------- | --------------------------- |
+| `invalid_message`      | A frame was not valid JSON, or not a valid message.                  | (stays open)                |
+| `not_joined`           | A message that needs a room was sent before `join_room`.             | (stays open)                |
+| `already_joined`       | A second `join_room` on the same connection.                         | (stays open)                |
+| `unsupported_protocol` | `join_room.protocolVersion` is not the server's.                     | **4001** (final)            |
+| `invalid_room`         | The server does not accept this room id (for example, too short).    | **4003** (final)            |
+| `room_full`            | Too many people are in this room.                                    | 1013 (try again later)      |
+| `server_busy`          | The server is at capacity (too many rooms or connections).           | 1013 (try again later)      |
+| `rate_limited`         | The connection flooded the server with excess or malformed messages. | 1008 (policy violation)     |
+
+A client must not reconnect automatically after a **final** close (4001, 4003):
+retrying cannot succeed until something changes. Every other close is retried with
+backoff.
+
+### Limits the server enforces
+
+The server refuses, quietly or loudly, what a stranger holding only a room link
+could use to exhaust it. The numbers are configurable (see
+[hardening](hardening.md)); the behaviour is part of the protocol:
+
+- **Ops** and **ephemeral messages** (`cursor`, `drag_preview`) each have their own
+  per-connection allowance. Excess ops get `op_reject: rate_limited`; excess
+  ephemeral messages are dropped without a reply.
+- Excess or malformed messages also cost the connection "strikes" that recover
+  over time. Run out, and it is closed with 1008.
+- Connections, rooms in memory, people per room, shapes per room, ops per room
+  and ops overall are capped (see the reject reasons and error codes above).
 
 ## Rules a client must follow
 
@@ -67,8 +95,14 @@ must not auto-reconnect on it.
 2. **Retries are safe.** Re-send an unacknowledged op with the **same `opId`**.
    If the server already has it, it answers with the stored `op_ack` (to the
    sender only) and stores nothing. If it does not, it processes it normally.
-3. **Drop rejected ops.** On `op_reject`, remove that op from the pending queue
-   and undo any optimistic change; retrying would be refused again.
+3. **Drop rejected ops, except "too fast".** On `op_reject`, remove that op from
+   the pending queue and undo any optimistic change; retrying would be refused
+   again. The exception is `rate_limited`: nothing is wrong with the op, so keep
+   it, and send it again after a pause (and not ahead of any older op it may
+   depend on).
+   Likewise, when catching up after a reconnect, re-send queued ops a few at a
+   time (the reference client sends 10 every 600 ms) so a long queue does not
+   trip the rate limit itself.
 4. **One op per gesture.** Send `drag_preview` while dragging and commit with a
    single `update_shape` on pointer-up. Discard a remote preview when an
    `op_ack` for that shape arrives or after a short timeout: there is no "drag

@@ -305,7 +305,12 @@ describe("rejections", () => {
     if (!result.ok) throw new Error("update failed");
 
     const effect = engine.receive({ type: "op_reject", opId: result.op.opId, reason: "unknown_shape" });
-    expect(effect.rejected).toEqual({ opId: result.op.opId, reason: "unknown_shape", wasPending: true });
+    expect(effect.rejected).toEqual({
+      opId: result.op.opId,
+      reason: "unknown_shape",
+      wasPending: true,
+      retryable: false,
+    });
     expect(engine.getLiveShapes().s1?.x).toBe(0);
     expect(engine.getPending()).toEqual([]);
   });
@@ -321,8 +326,51 @@ describe("rejections", () => {
   it("reports a rejection for an op it no longer holds", () => {
     const { engine } = makeEngine();
     const effect = engine.receive({ type: "op_reject", opId: "unknown", reason: "invalid" });
-    expect(effect.rejected).toEqual({ opId: "unknown", reason: "invalid", wasPending: false });
+    expect(effect.rejected).toEqual({
+      opId: "unknown",
+      reason: "invalid",
+      wasPending: false,
+      retryable: false,
+    });
   });
+
+  it("keeps an op the server refused as too fast: nothing is wrong with the op, so it is not rolled back", () => {
+    const { engine } = makeEngine();
+    const op = created(engine);
+    const effect = engine.receive({ type: "op_reject", opId: op.opId, reason: "rate_limited" });
+
+    expect(effect.rejected).toEqual({
+      opId: op.opId,
+      reason: "rate_limited",
+      wasPending: true,
+      retryable: true,
+    });
+    expect(engine.getPending()).toEqual([op]);
+    expect(engine.getLiveShapes().s1).toBeDefined(); // the edit stays on screen
+  });
+
+  it("does not call a too-fast refusal retryable for an op it no longer holds", () => {
+    const { engine } = makeEngine();
+    const effect = engine.receive({ type: "op_reject", opId: "gone", reason: "rate_limited" });
+    expect(effect.rejected).toEqual({
+      opId: "gone",
+      reason: "rate_limited",
+      wasPending: false,
+      retryable: false,
+    });
+  });
+
+  it.each(["invalid", "not_joined", "shape_exists", "unknown_shape", "room_full", "server_full"] as const)(
+    "rolls back an op refused with %s, and says it is not retryable",
+    (reason) => {
+      const { engine } = makeEngine();
+      const op = created(engine);
+      const effect = engine.receive({ type: "op_reject", opId: op.opId, reason });
+      expect(effect.rejected?.retryable).toBe(false);
+      expect(engine.getPending()).toEqual([]);
+      expect(engine.getLiveShapes()).toEqual({});
+    },
+  );
 
   it("passes server errors through", () => {
     const { engine } = makeEngine();

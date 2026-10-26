@@ -82,12 +82,24 @@ function isShapeSnapshot(value: unknown): value is ShapeSnapshot {
   return shape.deletedAt === undefined || isHlc(shape.deletedAt);
 }
 
-const REJECT_REASONS: readonly OpRejectReason[] = ["invalid", "not_joined", "shape_exists", "unknown_shape"];
+const REJECT_REASONS: readonly OpRejectReason[] = [
+  "invalid",
+  "not_joined",
+  "shape_exists",
+  "unknown_shape",
+  "rate_limited",
+  "room_full",
+  "server_full",
+];
 const ERROR_CODES: readonly ErrorCode[] = [
   "invalid_message",
   "not_joined",
   "already_joined",
   "unsupported_protocol",
+  "room_full",
+  "server_busy",
+  "rate_limited",
+  "invalid_room",
 ];
 
 function validate(value: unknown): ServerMessage | null {

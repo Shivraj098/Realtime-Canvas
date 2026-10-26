@@ -1,4 +1,9 @@
-import { CLOSE_UNSUPPORTED_PROTOCOL, type ClientMessage, type ServerMessage } from "@realtime-canvas/shared";
+import {
+  CLOSE_ROOM_REFUSED,
+  CLOSE_UNSUPPORTED_PROTOCOL,
+  type ClientMessage,
+  type ServerMessage,
+} from "@realtime-canvas/shared";
 import { parseServerMessage } from "./parse-server-message";
 import {
   realScheduler,
@@ -28,7 +33,9 @@ export type SocketStatus =
   /** Stopped on purpose. */
   | "closed"
   /** The server refused our protocol version. Retrying cannot help until the client is updated. */
-  | "unsupported_protocol";
+  | "unsupported_protocol"
+  /** The server refused this room (for example its id is too short). Retrying the same room cannot help. */
+  | "refused";
 
 export type BackoffOptions = {
   baseMs: number;
@@ -36,6 +43,13 @@ export type BackoffOptions = {
   /** Extra random delay, as a fraction of the delay (0.3 adds up to 30%). */
   jitter: number;
 };
+
+/** States that end the connection for good: nothing reconnects until `start` is called again. */
+function isTerminal(status: SocketStatus): boolean {
+  return (
+    status === "idle" || status === "closed" || status === "unsupported_protocol" || status === "refused"
+  );
+}
 
 export const DEFAULT_BACKOFF: BackoffOptions = { baseMs: 1000, maxMs: 15_000, jitter: 0.3 };
 
@@ -125,7 +139,7 @@ export class RoomSocket {
 
   /** Throws the current connection away and connects again immediately, without backoff. */
   reconnectNow(): void {
-    if (this.status === "idle" || this.status === "closed" || this.status === "unsupported_protocol") return;
+    if (isTerminal(this.status)) return;
     this.clearTimer();
     const hadSocket = this.dropSocket(1000);
     this.attempt = 0;
@@ -146,7 +160,7 @@ export class RoomSocket {
    * `reconnectNow`, a server that keeps misbehaving cannot make this loop hot.
    */
   reconnectLater(): void {
-    if (this.status === "idle" || this.status === "closed" || this.status === "unsupported_protocol") return;
+    if (isTerminal(this.status)) return;
     this.clearTimer();
     const hadSocket = this.dropSocket(1000);
     if (hadSocket) this.handlers.onClose?.();
@@ -213,6 +227,10 @@ export class RoomSocket {
       this.handlers.onClose?.();
       if (event.code === CLOSE_UNSUPPORTED_PROTOCOL) {
         this.setStatus("unsupported_protocol");
+        return;
+      }
+      if (event.code === CLOSE_ROOM_REFUSED) {
+        this.setStatus("refused");
         return;
       }
       this.scheduleReconnect();
