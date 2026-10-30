@@ -50,9 +50,15 @@ checkpoint.
       duplicate, PNG export, live cursors
 - [x] **Phase 5a — Hardening**: health check, heartbeat, origin allowlist,
       rate limits, capacity caps, idle-room eviction and snapshots
-- [ ] **Phase 5b — Deployment**: Dockerized server on Railway, static
-      client on Vercel (config and guide in [`docs/deployment.md`](docs/deployment.md);
-      tick this and add the live link once it is up)
+- [ ] **Phase 5b — Deployment**: Dockerized server on Koyeb (free instance),
+      static client on Vercel (config and guide in
+      [`docs/deployment.md`](docs/deployment.md); tick this and add the live link
+      once it is up)
+
+> **Live demo note:** the free server sleeps when idle and has no persistent
+> disk, so the first connection after a quiet spell is slow and boards reset
+> when it restarts. The same image keeps its boards on any host with a disk
+> mounted at `/data`.
 
 ## Development
 

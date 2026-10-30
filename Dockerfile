@@ -46,8 +46,10 @@ COPY --from=build /app/server/dist server/dist
 COPY server/package.json server/package.json
 COPY package.json package.json
 
-# The database lives on a volume mounted at /data. Created here so that running the
-# image without a volume (a quick local try) still works, as the unprivileged user.
+# The database path is /data/ops.sqlite. On a host with a persistent disk, mount it at
+# /data and boards survive restarts. Without one (a free instance), the folder still
+# works but is wiped on every restart, which empties the boards. Created here, owned by
+# the unprivileged user, so the server can write to it either way.
 RUN mkdir -p /data && chown node:node /data
 USER node
 EXPOSE 8080
