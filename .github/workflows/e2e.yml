@@ -10,7 +10,9 @@ on:
 # checks (lint, types, unit tests) report first and are not held up by it.
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: GitHub moved that label to a newer Ubuntu than this
+    # Playwright version supports, which broke the browser install. Move both together.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
