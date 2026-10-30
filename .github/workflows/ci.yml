@@ -34,3 +34,30 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  # The image that gets deployed must build and boot, not only the code inside it.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t realtime-canvas-server .
+
+      - name: Container starts and answers the health check
+        run: |
+          docker run -d --name rc -p 8080:8080 -e ALLOWED_ORIGINS=https://example.vercel.app realtime-canvas-server
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health; then echo; exit 0; fi
+            sleep 1
+          done
+          docker logs rc
+          exit 1
+
+      - name: Container shuts down cleanly on SIGTERM
+        run: |
+          docker stop rc
+          code=$(docker inspect --format '{{.State.ExitCode}}' rc)
+          docker logs rc
+          test "$code" = "0"

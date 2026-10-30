@@ -31,7 +31,8 @@ conflict-resolution logic, with test coverage in the adjacent
 ## Documentation
 
 [Wire protocol](docs/protocol.md) · [Client core](docs/client.md) ·
-[Canvas UI](docs/frontend.md) · [Server hardening](docs/hardening.md)
+[Canvas UI](docs/frontend.md) · [Server hardening](docs/hardening.md) ·
+[Deployment](docs/deployment.md)
 
 ## Status
 
@@ -49,8 +50,9 @@ checkpoint.
       duplicate, PNG export, live cursors
 - [x] **Phase 5a — Hardening**: health check, heartbeat, origin allowlist,
       rate limits, capacity caps, idle-room eviction and snapshots
-- [ ] **Phase 5b — Deployment**: Dockerized server on Fly.io, static
-      client on Vercel
+- [ ] **Phase 5b — Deployment**: Dockerized server on Railway, static
+      client on Vercel (config and guide in [`docs/deployment.md`](docs/deployment.md);
+      tick this and add the live link once it is up)
 
 ## Development
 
