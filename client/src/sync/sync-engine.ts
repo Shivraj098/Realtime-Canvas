@@ -1,6 +1,7 @@
 import {
   applyOp,
   compareHlc,
+  geometryProblem,
   getShape,
   HybridLogicalClock,
   isDeleted,
@@ -18,6 +19,7 @@ import {
   type ServerMessage,
   type ShapeChanges,
   type ShapeFields,
+  type ShapeKind,
 } from "@realtime-canvas/shared";
 
 /**
@@ -59,7 +61,13 @@ export type SyncEngineOptions = {
   protocolVersion?: number;
 };
 
-export type LocalRejectReason = "unknown_shape" | "shape_exists" | "empty_changes" | "queue_full";
+export type LocalRejectReason =
+  | "unknown_shape"
+  | "shape_exists"
+  | "empty_changes"
+  | "queue_full"
+  /** A box given a negative size. Only lines and arrows may have one. */
+  | "invalid_geometry";
 export type LocalResult = { ok: true; op: Op } | { ok: false; reason: LocalRejectReason };
 
 export type PresenceEntry = { clientId: string; color: string };
@@ -204,13 +212,15 @@ export class SyncEngine {
 
   // ---- local edits ---------------------------------------------------
 
-  createShape(fields: ShapeFields, shapeId: string = this.newId()): LocalResult {
+  createShape(kind: ShapeKind, fields: ShapeFields, shapeId: string = this.newId()): LocalResult {
     if (this.pending.length >= this.maxPending) return { ok: false, reason: "queue_full" };
     if (getShape(this.getView(), shapeId)) return { ok: false, reason: "shape_exists" };
+    if (geometryProblem(kind, fields)) return { ok: false, reason: "invalid_geometry" };
     return this.enqueue({
       type: "create_shape",
       shapeId,
       roomId: this.roomId,
+      kind,
       fields: { ...fields },
       hlc: this.clock.tick(),
       opId: this.newId(),
@@ -221,7 +231,9 @@ export class SyncEngine {
     const cleaned = cleanChanges(changes);
     if (Object.keys(cleaned).length === 0) return { ok: false, reason: "empty_changes" };
     if (this.pending.length >= this.maxPending) return { ok: false, reason: "queue_full" };
-    if (!this.isLiveInView(shapeId)) return { ok: false, reason: "unknown_shape" };
+    const shape = getShape(this.getView(), shapeId);
+    if (!shape || isDeleted(shape)) return { ok: false, reason: "unknown_shape" };
+    if (geometryProblem(shape.kind, cleaned)) return { ok: false, reason: "invalid_geometry" };
     return this.enqueue({
       type: "update_shape",
       shapeId,

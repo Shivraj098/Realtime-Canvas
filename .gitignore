@@ -9,3 +9,4 @@ data/
 .env.local
 playwright-report/
 test-results/
+*.zip

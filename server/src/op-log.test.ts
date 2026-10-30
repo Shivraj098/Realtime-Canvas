@@ -10,7 +10,8 @@ function makeOp(shapeId: string, physical = 100, opId = `op-${shapeId}`): Op {
     type: "create_shape",
     shapeId,
     roomId: "room1",
-    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000" },
+    kind: "rect",
+    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000", text: "" },
     hlc: { physical, logical: 0, nodeId: "server" },
     opId,
   };
@@ -166,7 +167,7 @@ describe("OpLog durability", () => {
 
 describe("OpLog snapshots", () => {
   const state = {
-    s1: { x: 1, y: 2, width: 3, height: 4, color: "#fff", lastHlc: {} },
+    s1: { kind: "rect", x: 1, y: 2, width: 3, height: 4, color: "#fff", text: "", lastHlc: { text: {} } },
   } as unknown as import("@realtime-canvas/shared").RoomState;
 
   it("has no snapshot until one is saved", () => {
@@ -257,5 +258,46 @@ describe("OpLog.ping", () => {
     expect(() => log.ping()).not.toThrow();
     log.close();
     expect(() => log.ping()).toThrow();
+  });
+});
+
+describe("OpLog: data written before shapes had a kind and a text", () => {
+  const hlc = { physical: 5, logical: 0, nodeId: "server" };
+
+  it("reads an old create_shape op as a rectangle with no label", () => {
+    const log = new OpLog(":memory:");
+    // Written the way protocol 2 stored it: no `kind`, no `fields.text`.
+    const legacy = {
+      type: "create_shape",
+      shapeId: "old",
+      roomId: "room1",
+      fields: { x: 1, y: 2, width: 3, height: 4, color: "#fff" },
+      hlc,
+      opId: "old-op",
+    };
+    log.append("room1", legacy as unknown as Op);
+    const [stored] = log.since("room1", 0);
+    expect(stored!.op).toMatchObject({ kind: "rect", fields: { text: "", x: 1 } });
+    expect(log.find("room1", "old-op")!.op).toMatchObject({ kind: "rect" });
+    log.close();
+  });
+
+  it("reads an old snapshot the same way, and never overwrites a kind that is already there", () => {
+    const log = new OpLog(":memory:");
+    const shape = (extra: object) => ({
+      x: 1,
+      y: 2,
+      width: 3,
+      height: 4,
+      color: "#fff",
+      lastHlc: { x: hlc, y: hlc, width: hlc, height: hlc, color: hlc },
+      ...extra,
+    });
+    log.saveSnapshot("room1", 3, { old: shape({}), current: shape({ kind: "arrow", text: "hi" }) } as never);
+    const { state } = log.loadSnapshot("room1")!;
+    expect(state.old).toMatchObject({ kind: "rect", text: "" });
+    expect(state.old!.lastHlc.text).toEqual(hlc);
+    expect(state.current).toMatchObject({ kind: "arrow", text: "hi" });
+    log.close();
   });
 });

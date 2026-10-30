@@ -3,6 +3,36 @@ import type { Op, RoomState } from "@realtime-canvas/shared";
 
 export type StoredOp = { seq: number; op: Op };
 
+/**
+ * Data written before shapes had a kind and a text (protocol 2) is still in
+ * any database that was used then. These two functions read it as what it was
+ * - a rectangle with no label - so an upgrade never loses a board. Current
+ * data passes through untouched.
+ */
+function upgradeOp(op: Op): Op {
+  if (op.type !== "create_shape") return op;
+  const legacy = op as Partial<Pick<typeof op, "kind">> & { fields: Partial<typeof op.fields> };
+  if (legacy.kind !== undefined && legacy.fields.text !== undefined) return op;
+  return { ...op, kind: legacy.kind ?? "rect", fields: { ...op.fields, text: legacy.fields.text ?? "" } };
+}
+
+function upgradeState(state: RoomState): RoomState {
+  const upgraded: RoomState = {};
+  for (const [shapeId, shape] of Object.entries(state)) {
+    const legacy = shape as Partial<typeof shape>;
+    upgraded[shapeId] =
+      legacy.kind !== undefined && legacy.text !== undefined && legacy.lastHlc?.text !== undefined
+        ? shape
+        : {
+            ...shape,
+            kind: legacy.kind ?? "rect",
+            text: legacy.text ?? "",
+            lastHlc: { ...shape.lastHlc, text: shape.lastHlc.text ?? shape.lastHlc.color },
+          };
+  }
+  return upgraded;
+}
+
 /** A room's materialized state as of op `seq`, saved so a room can be loaded without replaying its whole log. */
 export type StoredSnapshot = { seq: number; state: RoomState };
 
@@ -113,7 +143,7 @@ export class OpLog {
   /** The op already stored under this opId in the room, with its sequence number, or null. */
   find(roomId: string, opId: string): StoredOp | null {
     const row = this.findByOpIdStmt.get({ roomId, opId }) as { seq: number; op_json: string } | undefined;
-    return row ? { seq: row.seq, op: JSON.parse(row.op_json) as Op } : null;
+    return row ? { seq: row.seq, op: upgradeOp(JSON.parse(row.op_json) as Op) } : null;
   }
 
   /**
@@ -135,13 +165,13 @@ export class OpLog {
   /** The room's saved snapshot, or null if it has none. Throws if the stored JSON is unreadable. */
   loadSnapshot(roomId: string): StoredSnapshot | null {
     const row = this.loadSnapshotStmt.get({ roomId }) as { seq: number; state_json: string } | undefined;
-    return row ? { seq: row.seq, state: JSON.parse(row.state_json) as RoomState } : null;
+    return row ? { seq: row.seq, state: upgradeState(JSON.parse(row.state_json) as RoomState) } : null;
   }
 
   /** All ops after `sinceSeq`, in order - what a reconnecting client needs to catch up. */
   since(roomId: string, sinceSeq: number): StoredOp[] {
     const rows = this.selectSinceStmt.all({ roomId, sinceSeq }) as { seq: number; op_json: string }[];
-    return rows.map((row) => ({ seq: row.seq, op: JSON.parse(row.op_json) as Op }));
+    return rows.map((row) => ({ seq: row.seq, op: upgradeOp(JSON.parse(row.op_json) as Op) }));
   }
 
   close(): void {

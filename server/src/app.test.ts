@@ -141,7 +141,8 @@ function createShape(shapeId: string, roomId = "room1", opId = `op-${shapeId}`):
     type: "create_shape",
     shapeId,
     roomId,
-    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000000" },
+    kind: "rect",
+    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000000", text: "" },
     hlc: claimedHlc(),
     opId,
   };
@@ -167,7 +168,8 @@ function createShapeAsOp(): Op {
     type: "create_shape",
     shapeId: "shape1",
     roomId: "room1",
-    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000000" },
+    kind: "rect",
+    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000000", text: "" },
     hlc: { physical: 1, logical: 0, nodeId: "server" },
     opId: "op-shape1",
   };
@@ -690,7 +692,8 @@ describe("rejected ops", () => {
 
     send(client, {
       ...createShape("shape1", "room1", "second"),
-      fields: { x: 99, y: 99, width: 1, height: 1, color: "#111111" },
+      kind: "rect",
+      fields: { x: 99, y: 99, width: 1, height: 1, color: "#111111", text: "" },
     } as ClientMessage);
     expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "second", reason: "shape_exists" });
 
@@ -1703,5 +1706,133 @@ describe("shutting down with people connected", () => {
     await server.close();
     await closed;
     expect(client.socket.readyState).toBe(WebSocket.CLOSED);
+  });
+});
+
+describe("shape kinds, lines and text", () => {
+  const shapeOf = (
+    kind: Extract<Op, { type: "create_shape" }>["kind"],
+    shapeId: string,
+    fields = {},
+  ): ClientMessage => ({
+    type: "create_shape",
+    shapeId,
+    roomId: "room1",
+    kind,
+    fields: { x: 100, y: 100, width: -60, height: -40, color: "#6aa9f4", text: "", ...fields },
+    hlc: claimedHlc(),
+    opId: `op-${shapeId}`,
+  });
+  const resize = (shapeId: string, changes: object, opId: string): ClientMessage => ({
+    type: "update_shape",
+    shapeId,
+    roomId: "room1",
+    changes,
+    hlc: claimedHlc(),
+    opId,
+  });
+
+  it("stores an arrow that points up and to the left, and sends its kind to later joiners", async () => {
+    const server = startServer();
+    const alice = await joinFresh(server, "room1", "alice");
+    send(alice, shapeOf("arrow", "a1", { text: "" }));
+    expect(await alice.inbox.next("op_ack")).toMatchObject({ seq: 1, op: { kind: "arrow" } });
+
+    const bob = await joinRoom(server, "room1", "bob");
+    const snapshot = await bob.inbox.next("sync_snapshot");
+    expect(snapshot.shapes.a1).toMatchObject({ kind: "arrow", width: -60, height: -40 });
+  });
+
+  it("refuses a rectangle with a negative size before it reaches the log", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, shapeOf("rect", "bad"));
+    expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "op-bad", reason: "invalid" });
+    send(client, createShape("probe"));
+    expect((await client.inbox.next("op_ack")).seq).toBe(1);
+  });
+
+  it("refuses to resize an existing box to a negative size, but lets a line or arrow do it", async () => {
+    const server = startServer();
+    const client = await joinFresh(server, "room1", "clientA");
+    send(client, createShape("box"));
+    send(client, shapeOf("line", "ln", { width: 50, height: 0 }));
+    await client.inbox.next("op_ack");
+    await client.inbox.next("op_ack");
+
+    send(client, resize("box", { width: -5 }, "box-neg"));
+    expect(await client.inbox.next("op_reject")).toMatchObject({ opId: "box-neg", reason: "invalid" });
+
+    send(client, resize("ln", { width: -50, height: -10 }, "ln-neg"));
+    expect(await client.inbox.next("op_ack")).toMatchObject({ seq: 3, op: { opId: "ln-neg" } });
+  });
+
+  it("keeps a concurrent recolor and relabel of one shape", async () => {
+    const server = startServer();
+    const alice = await joinFresh(server, "room1", "alice");
+    const bob = await joinFresh(server, "room1", "bob");
+    send(alice, createShape("s1"));
+    await alice.inbox.next("op_ack");
+    await bob.inbox.next("op_ack");
+
+    send(alice, resize("s1", { text: "hello" }, "label"));
+    send(bob, resize("s1", { color: "#ff0000" }, "paint"));
+    await alice.inbox.next("op_ack");
+    await alice.inbox.next("op_ack");
+
+    const late = await joinRoom(server, "room1", "late");
+    const { shapes } = await late.inbox.next("sync_snapshot");
+    expect(shapes.s1).toMatchObject({ text: "hello", color: "#ff0000" });
+  });
+
+  it("relays a drag preview that flips a line, but drops one that would flip a box", async () => {
+    const server = startServer();
+    const alice = await joinFresh(server, "room1", "alice");
+    const bob = await joinFresh(server, "room1", "bob");
+    send(alice, createShape("box"));
+    send(alice, shapeOf("arrow", "ar", { width: 10, height: 10 }));
+    await alice.inbox.next("op_ack");
+    await alice.inbox.next("op_ack");
+    await bob.inbox.next("op_ack");
+    await bob.inbox.next("op_ack");
+
+    const preview = (shapeId: string): ClientMessage => ({
+      type: "drag_preview",
+      roomId: "room1",
+      clientId: "alice",
+      shapeId,
+      changes: { width: -20 },
+    });
+    send(alice, preview("box"));
+    send(alice, preview("ar"));
+    expect(await bob.inbox.next("drag_preview")).toMatchObject({ shapeId: "ar" });
+    expect(bob.inbox.pending("drag_preview")).toBe(0);
+  });
+
+  it("loads a database written before shapes had a kind and a text as plain rectangles", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rc-legacy-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "legacy.sqlite");
+    const log = new OpLog(dbPath);
+    const legacyCreate = {
+      type: "create_shape",
+      shapeId: "old",
+      roomId: "room1",
+      fields: { x: 5, y: 6, width: 7, height: 8, color: "#123456" },
+      hlc: { physical: 1, logical: 0, nodeId: "server" },
+      opId: "old-op",
+    };
+    log.append("room1", legacyCreate as unknown as Op);
+    log.close();
+
+    const server = startServer({ dbPath });
+    const client = await joinRoom(server, "room1", "clientA");
+    const snapshot = await client.inbox.next("sync_snapshot");
+    expect(snapshot.shapes.old).toMatchObject({ kind: "rect", text: "", x: 5, color: "#123456" });
+    expect(snapshot.shapes.old!.lastHlc.text).toBeDefined();
+
+    // And the old shape can be labelled like any other.
+    send(client, resize("old", { text: "legacy" }, "relabel"));
+    expect(await client.inbox.next("op_ack")).toMatchObject({ seq: 2, op: { changes: { text: "legacy" } } });
   });
 });

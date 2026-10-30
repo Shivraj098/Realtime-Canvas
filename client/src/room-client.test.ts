@@ -10,7 +10,7 @@ import {
 import { RoomClient, type RoomClientEvent } from "./room-client";
 import { FakeScheduler, FakeWebSocket } from "./test-support/fake-websocket";
 
-const FIELDS: ShapeFields = { x: 0, y: 0, width: 10, height: 10, color: "#000000" };
+const FIELDS: ShapeFields = { x: 0, y: 0, width: 10, height: 10, color: "#000000", text: "" };
 const hlc = (physical: number) => ({ physical, logical: 0, nodeId: "server" });
 
 beforeEach(() => FakeWebSocket.reset());
@@ -89,7 +89,7 @@ describe("edits", () => {
   it("applies an edit locally and sends it at once when online", () => {
     const { client } = connected();
     FakeWebSocket.latest.receive(emptySnapshot);
-    const result = client.createShape(FIELDS, "s1");
+    const result = client.createShape("rect", FIELDS, "s1");
     expect(result.ok).toBe(true);
     expect(client.engine.getLiveShapes().s1).toBeDefined();
     expect(types(FakeWebSocket.latest.sent)).toEqual(["join_room", "create_shape"]);
@@ -97,8 +97,8 @@ describe("edits", () => {
 
   it("queues edits made while offline, and sends them after the join once connected", () => {
     const { client } = setup();
-    client.createShape(FIELDS, "a");
-    client.createShape(FIELDS, "b");
+    client.createShape("rect", FIELDS, "a");
+    client.createShape("rect", FIELDS, "b");
     expect(client.engine.getPending()).toHaveLength(2);
 
     client.connect();
@@ -119,7 +119,7 @@ describe("edits", () => {
 
   it("clears an edit from pending when its ack arrives", () => {
     const { client } = connected();
-    const result = client.createShape(FIELDS, "s1");
+    const result = client.createShape("rect", FIELDS, "s1");
     if (!result.ok) throw new Error("create failed");
     FakeWebSocket.latest.receive(ack(1, stamp(result.op)));
     expect(client.engine.getPending()).toEqual([]);
@@ -130,14 +130,14 @@ describe("edits", () => {
 describe("reconnecting", () => {
   it("rejoins from the last sequence number and re-sends what was never acknowledged", () => {
     const { client, scheduler } = connected();
-    const first = client.createShape(FIELDS, "a");
+    const first = client.createShape("rect", FIELDS, "a");
     if (!first.ok) throw new Error("create failed");
     FakeWebSocket.latest.receive(ack(1, stamp(first.op))); // acknowledged
-    client.createShape(FIELDS, "b"); // sent, never acknowledged
+    client.createShape("rect", FIELDS, "b"); // sent, never acknowledged
     const unacked = client.engine.getPending()[0] as Op;
 
     FakeWebSocket.latest.serverClose();
-    client.createShape(FIELDS, "c"); // made while offline
+    client.createShape("rect", FIELDS, "c"); // made while offline
     scheduler.fireNext();
     FakeWebSocket.latest.open();
 
@@ -154,7 +154,7 @@ describe("reconnecting", () => {
       roomId: "r",
       clients: [{ clientId: "a", color: "#fff" }],
     });
-    client.createShape(FIELDS, "s1");
+    client.createShape("rect", FIELDS, "s1");
     FakeWebSocket.latest.serverClose();
     expect(client.engine.getPresence()).toEqual([]);
     expect(client.engine.getPending()).toHaveLength(1);
@@ -163,7 +163,7 @@ describe("reconnecting", () => {
 
   it("reconnects after the backoff when a gap in the op stream is detected", () => {
     const { client, scheduler, events } = connected();
-    const result = client.createShape(FIELDS, "s1");
+    const result = client.createShape("rect", FIELDS, "s1");
     if (!result.ok) throw new Error("create failed");
     FakeWebSocket.latest.receive(ack(5, stamp(result.op))); // seq 1..4 never arrived
 
@@ -179,7 +179,7 @@ describe("reconnecting", () => {
 describe("catching up after a reconnect", () => {
   const shapeIds = (messages: ClientMessage[]) => messages.map((m) => (m as { shapeId?: string }).shapeId);
   const fill = (client: RoomClient, count: number) => {
-    for (let i = 0; i < count; i++) client.createShape(FIELDS, `s${i}`);
+    for (let i = 0; i < count; i++) client.createShape("rect", FIELDS, `s${i}`);
   };
 
   it("re-sends a long queue in paced batches, not all at once, so it cannot trip the server's rate limit", () => {
@@ -241,7 +241,7 @@ describe("catching up after a reconnect", () => {
 
   it("sends a new edit straight away when nothing is waiting", () => {
     const { client } = connected();
-    client.createShape(FIELDS, "now");
+    client.createShape("rect", FIELDS, "now");
     expect(shapeIds(FakeWebSocket.latest.sent)).toEqual([undefined, "now"]);
   });
 
@@ -262,7 +262,7 @@ describe("catching up after a reconnect", () => {
 describe("when the server says an op came too fast", () => {
   it("keeps the edit, tells the UI it is a notice and not a rollback, and sends it again after a pause", () => {
     const { client, scheduler, events } = connected({ retryDelayMs: 1500 });
-    const result = client.createShape(FIELDS, "s1");
+    const result = client.createShape("rect", FIELDS, "s1");
     if (!result.ok) throw new Error("create failed");
     const sentBefore = FakeWebSocket.latest.sent.length;
 
@@ -284,7 +284,7 @@ describe("when the server says an op came too fast", () => {
 
   it("holds later edits behind the one that is waiting to be retried", () => {
     const { client, scheduler } = connected();
-    const first = client.createShape(FIELDS, "s1");
+    const first = client.createShape("rect", FIELDS, "s1");
     if (!first.ok) throw new Error("create failed");
     FakeWebSocket.latest.receive({ type: "op_reject", opId: first.op.opId, reason: "rate_limited" });
 
@@ -301,7 +301,7 @@ describe("when the server says an op came too fast", () => {
   it("puts several retried ops back in their original order", () => {
     const { client, scheduler } = connected({ flushBatchSize: 10 });
     const ops = ["a", "b", "c"].map((id) => {
-      const result = client.createShape(FIELDS, id);
+      const result = client.createShape("rect", FIELDS, id);
       if (!result.ok) throw new Error("create failed");
       return result.op;
     });
@@ -316,7 +316,7 @@ describe("when the server says an op came too fast", () => {
 
   it("still rolls back an op the server refuses for a reason that waiting cannot fix", () => {
     const { client, scheduler, events } = connected();
-    const result = client.createShape(FIELDS, "s1");
+    const result = client.createShape("rect", FIELDS, "s1");
     if (!result.ok) throw new Error("create failed");
     FakeWebSocket.latest.receive({ type: "op_reject", opId: result.op.opId, reason: "room_full" });
 
@@ -335,7 +335,7 @@ describe("when the server says an op came too fast", () => {
 describe("rejections and errors", () => {
   it("emits the rejection and rolls the edit back", () => {
     const { client, events } = connected();
-    const create = client.createShape(FIELDS, "s1");
+    const create = client.createShape("rect", FIELDS, "s1");
     if (!create.ok) throw new Error("create failed");
     FakeWebSocket.latest.receive(ack(1, stamp(create.op, 10)));
     const update = client.updateShape("s1", { x: 5 });

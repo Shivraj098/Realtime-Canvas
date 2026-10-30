@@ -11,22 +11,18 @@ describe("AppState", () => {
 
   it("changes and reports each setting", () => {
     const state = new AppState("#123456");
-    state.setTool("rectangle");
+    state.setTool("rect");
     state.setColor("#abcdef");
     state.setSelectedId("s1");
-    expect([state.getTool(), state.getColor(), state.getSelectedId()]).toEqual([
-      "rectangle",
-      "#abcdef",
-      "s1",
-    ]);
+    expect([state.getTool(), state.getColor(), state.getSelectedId()]).toEqual(["rect", "#abcdef", "s1"]);
   });
 
   it("notifies on a real change but not on setting the same value again", () => {
     const state = new AppState("#123456");
     const listener = vi.fn();
     state.subscribe(listener);
-    state.setTool("rectangle");
-    state.setTool("rectangle");
+    state.setTool("rect");
+    state.setTool("rect");
     state.setColor("#123456");
     state.setSelectedId(null);
     expect(listener).toHaveBeenCalledTimes(1);
@@ -37,7 +33,7 @@ describe("AppState", () => {
     const listener = vi.fn();
     const unsubscribe = state.subscribe(listener);
     unsubscribe();
-    state.setTool("rectangle");
+    state.setTool("rect");
     expect(listener).not.toHaveBeenCalled();
   });
 });

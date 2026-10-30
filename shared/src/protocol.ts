@@ -23,7 +23,7 @@ import type { HlcTimestamp } from "./hlc";
  * a tab left open across a deploy fails loudly instead of misbehaving.
  * Bump it on any change an older peer could not understand.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** WebSocket close code the server uses after refusing an unsupported protocol version. A client must not auto-reconnect on it: retrying cannot succeed until the client is updated. */
 export const CLOSE_UNSUPPORTED_PROTOCOL = 4001;
@@ -37,12 +37,49 @@ export const CLOSE_POLICY_VIOLATION = 1008;
 /** Standard close code for "full right now, try again later" (room or server at capacity). */
 export const CLOSE_TRY_AGAIN_LATER = 1013;
 
+/**
+ * What a shape is. Fixed when the shape is created and never changed by an
+ * update (turning a rectangle into an arrow is not an edit anyone needs),
+ * so it is not a conflict-resolved field.
+ *
+ * `line` and `arrow` are LINEAR: `x`,`y` is the start point and `width`,
+ * `height` is the vector to the end point, so both may be negative. Every
+ * other kind is a box where `width` and `height` are never negative.
+ * `text` is a box whose own content is the shape.
+ */
+export const SHAPE_KINDS = ["rect", "ellipse", "diamond", "triangle", "line", "arrow", "text"] as const;
+export type ShapeKind = (typeof SHAPE_KINDS)[number];
+
+export function isLinearKind(kind: ShapeKind): boolean {
+  return kind === "line" || kind === "arrow";
+}
+
+/**
+ * Why a width/height change is illegal for a shape of this kind, or null if
+ * it is fine: only a line or arrow may have a negative size. One definition,
+ * used by the server (which refuses the op) and the client (which never
+ * builds it), so the two cannot disagree.
+ */
+export function geometryProblem(
+  kind: ShapeKind,
+  size: { width?: number | undefined; height?: number | undefined },
+): string | null {
+  if (isLinearKind(kind)) return null;
+  if ((size.width ?? 0) < 0 || (size.height ?? 0) < 0) return "a box cannot have a negative width or height";
+  return null;
+}
+
+/** Longest text a shape may hold, in UTF-16 code units. Bounds the op log and the room state. */
+export const MAX_TEXT_LENGTH = 500;
+
 export type ShapeFields = {
   x: number;
   y: number;
   width: number;
   height: number;
   color: string;
+  /** A label for closed shapes, the content of a `text` shape. May be empty. */
+  text: string;
 };
 
 /** Every shape field, in a fixed order, for code that iterates fields deterministically. */
@@ -52,6 +89,7 @@ export const SHAPE_FIELD_KEYS = [
   "width",
   "height",
   "color",
+  "text",
 ] as const satisfies readonly (keyof ShapeFields)[];
 
 /**
@@ -72,6 +110,7 @@ export type Op =
       type: "create_shape";
       shapeId: string;
       roomId: string;
+      kind: ShapeKind;
       fields: ShapeFields;
       hlc: HlcTimestamp;
       opId: string;
@@ -203,6 +242,7 @@ export type Presence = {
 
 /** A shape as the server keeps it: field values, the HLC of each field's last write, and a tombstone when deleted. */
 export type ShapeSnapshot = ShapeFields & {
+  kind: ShapeKind;
   lastHlc: Record<keyof ShapeFields, HlcTimestamp>;
   /** Present once the shape has been deleted. Deleted shapes stay in state as tombstones so a replayed `create` cannot bring them back. Render only shapes without it. */
   deletedAt?: HlcTimestamp;

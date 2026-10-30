@@ -2,9 +2,17 @@ import { describe, expect, it } from "vitest";
 import { parseClientMessage, rejectableOpId } from "./validation";
 
 const hlc = { physical: 1000, logical: 0, nodeId: "client-1" };
-const fields = { x: 10, y: 20, width: 90, height: 90, color: "#7fd8b0" };
+const fields = { x: 10, y: 20, width: 90, height: 90, color: "#7fd8b0", text: "" };
 
-const validCreate = { type: "create_shape", shapeId: "s1", roomId: "room1", fields, hlc, opId: "op1" };
+const validCreate = {
+  type: "create_shape",
+  shapeId: "s1",
+  roomId: "room1",
+  kind: "rect",
+  fields,
+  hlc,
+  opId: "op1",
+};
 const validUpdate = {
   type: "update_shape",
   shapeId: "s1",
@@ -166,7 +174,6 @@ describe("parseClientMessage: rejects malformed input", () => {
     ["empty changes", {}],
     ["a color change (previews are geometry only)", { color: "#fff" }],
     ["an out-of-range coordinate", { x: 1e9 }],
-    ["negative width", { width: -1 }],
   ])("rejects a drag_preview with %s", (_name, changes) => {
     expect(parseClientMessage({ ...validDrag, changes }).ok).toBe(false);
   });
@@ -213,5 +220,54 @@ describe("rejectableOpId", () => {
     ["an array", []],
   ])("returns null for %s", (_name, value) => {
     expect(rejectableOpId(value)).toBeNull();
+  });
+});
+
+describe("parseClientMessage: shape kinds and text", () => {
+  const create = (kind: string, overrides: object = {}) => ({
+    ...validCreate,
+    kind,
+    fields: { ...fields, ...overrides },
+  });
+
+  it.each(["rect", "ellipse", "diamond", "triangle", "line", "arrow", "text"])("accepts kind %s", (kind) => {
+    expect(parseClientMessage(create(kind)).ok).toBe(true);
+  });
+
+  it("refuses an unknown kind and a missing kind", () => {
+    expect(parseClientMessage(create("star")).ok).toBe(false);
+    expect(parseClientMessage(omit(validCreate, "kind")).ok).toBe(false);
+  });
+
+  it.each(["line", "arrow"])("lets a %s point up and to the left (negative width and height)", (kind) => {
+    expect(parseClientMessage(create(kind, { width: -80, height: -30 })).ok).toBe(true);
+  });
+
+  it.each(["rect", "ellipse", "diamond", "triangle", "text"])("refuses a %s with a negative size", (kind) => {
+    expect(parseClientMessage(create(kind, { width: -1 })).ok).toBe(false);
+    expect(parseClientMessage(create(kind, { height: -1 })).ok).toBe(false);
+  });
+
+  it("refuses a size beyond the world limit in either direction", () => {
+    expect(parseClientMessage(create("line", { width: 1e9 })).ok).toBe(false);
+    expect(parseClientMessage(create("line", { height: -1e9 })).ok).toBe(false);
+  });
+
+  it("requires text on create, and accepts up to the limit", () => {
+    const { text: _text, ...withoutText } = fields;
+    void _text;
+    expect(parseClientMessage({ ...validCreate, fields: withoutText }).ok).toBe(false);
+    expect(parseClientMessage(create("text", { text: "a".repeat(500) })).ok).toBe(true);
+    expect(parseClientMessage(create("text", { text: "a".repeat(501) })).ok).toBe(false);
+    expect(parseClientMessage(create("text", { text: 5 })).ok).toBe(false);
+  });
+
+  it("accepts a text-only update, and refuses an over-long one", () => {
+    expect(parseClientMessage({ ...validUpdate, changes: { text: "hello\nworld" } }).ok).toBe(true);
+    expect(parseClientMessage({ ...validUpdate, changes: { text: "a".repeat(501) } }).ok).toBe(false);
+  });
+
+  it("cannot change a kind through an update: the key is stripped and the update refused as empty", () => {
+    expect(parseClientMessage({ ...validUpdate, changes: { kind: "arrow" } }).ok).toBe(false);
   });
 });

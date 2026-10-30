@@ -6,7 +6,7 @@ sides; the server validates every inbound frame against a matching `zod`
 schema in [`server/src/validation.ts`](../server/src/validation.ts).
 
 **Transport:** one WebSocket per client, JSON text frames only. A binary frame
-is dropped. **Version:** `PROTOCOL_VERSION` (currently `2`), sent in
+is dropped. **Version:** `PROTOCOL_VERSION` (currently `3`), sent in
 `join_room`.
 
 ## Two kinds of traffic
@@ -18,14 +18,36 @@ is dropped. **Version:** `PROTOCOL_VERSION` (currently `2`), sent in
 
 ## Client to server
 
-| Message        | Purpose                                                                                      |
-| -------------- | -------------------------------------------------------------------------------------------- |
-| `join_room`    | Must be first. `{ protocolVersion, roomId, clientId, sinceSeq }`                             |
-| `create_shape` | `{ shapeId, opId, hlc, fields }`                                                             |
-| `update_shape` | `{ shapeId, opId, hlc, changes }`: one or more of `x y width height color`, applied together |
-| `delete_shape` | `{ shapeId, opId, hlc }`                                                                     |
-| `cursor`       | `{ x, y, color, ... }`, relayed to the others in the room                                    |
-| `drag_preview` | `{ shapeId, changes }` with geometry fields only, relayed to the others                      |
+| Message        | Purpose                                                                                           |
+| -------------- | ------------------------------------------------------------------------------------------------- |
+| `join_room`    | Must be first. `{ protocolVersion, roomId, clientId, sinceSeq }`                                  |
+| `create_shape` | `{ shapeId, opId, hlc, kind, fields }`                                                            |
+| `update_shape` | `{ shapeId, opId, hlc, changes }`: one or more of `x y width height color text`, applied together |
+| `delete_shape` | `{ shapeId, opId, hlc }`                                                                          |
+| `cursor`       | `{ x, y, color, ... }`, relayed to the others in the room                                         |
+| `drag_preview` | `{ shapeId, changes }` with geometry fields only, relayed to the others                           |
+
+## Shapes: kinds, lines and text
+
+Every shape has a `kind`, chosen at creation and never changed by an update:
+`rect`, `ellipse`, `diamond`, `triangle`, `line`, `arrow` or `text`. It is not a
+conflict-resolved field; the other six fields (`x y width height color text`) are,
+each its own last-writer-wins register, so one person relabelling a shape while
+another recolours it keeps both.
+
+- **Boxes** (everything but `line` and `arrow`): `x`,`y` is the top-left corner and
+  `width`,`height` are never negative.
+- **Lines and arrows** are a vector: `x`,`y` is the start and `width`,`height` is
+  the way to the end point, so both may be negative (an arrow pointing up and to
+  the left). The server enforces the difference: a box with a negative size is
+  refused (`invalid`) on create, on update (checked against the stored kind) and in
+  a `drag_preview`.
+- **`text`** is at most 500 characters. On a closed shape it is a label; a `text`
+  shape's content is its text. A `text` shape's height is set by the client to fit
+  its wrapped text.
+
+Data written by protocol 2 (no `kind`, no `text`) is read as rectangles with no
+label, so upgrading the server never loses a board.
 
 `roomId` and `clientId` inside any message after the join are ignored and
 replaced with the values from the connection. The `hlc` in an op is a hint the

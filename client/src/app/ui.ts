@@ -1,7 +1,10 @@
 import type { RoomClient, RoomClientEvent } from "../room-client";
 import type { SocketStatus } from "../net/room-socket";
 import type { RemotePreview } from "../sync/sync-engine";
+import { TOOL_ICONS } from "./icons";
+import type { Tool } from "./interaction";
 import { labelFor } from "./scene";
+import { ALL_TOOLS, SHAPE_NAMES, TOOL_KEYS, TOOL_NAMES } from "./shortcuts";
 import type { AppState } from "./state";
 
 /** What the connection indicator says for each state of the socket. */
@@ -88,11 +91,42 @@ function previewFor(shapeId: string, previews: readonly RemotePreview[]) {
  * the canvas. It exists so screen readers can reach what is drawn, and so
  * end-to-end tests can read the board without inspecting pixels.
  */
-export function mountUi(client: RoomClient, state: AppState, onDelete: () => void): () => void {
-  const toolButtons = {
-    select: element<HTMLButtonElement>("tool-select"),
-    rectangle: element<HTMLButtonElement>("tool-rectangle"),
-  };
+export type UiActions = {
+  onDelete: () => void;
+  onDuplicate: () => void;
+  onExport: () => void;
+};
+
+/** What a shape reads as to a screen reader: its kind, then its label if it has one. */
+export function describeShape(
+  kind: keyof typeof SHAPE_NAMES,
+  shape: { x: number; y: number; width: number; height: number; color: string; text: string },
+  beingMoved: boolean,
+): string {
+  const label = shape.text === "" ? "" : `, saying "${shape.text}"`;
+  const moved = beingMoved ? ", being moved by someone else" : "";
+  return `${SHAPE_NAMES[kind]}${label}, ${shape.color}, at ${shape.x}, ${shape.y}, ${shape.width} by ${shape.height}${moved}`;
+}
+
+export function mountUi(client: RoomClient, state: AppState, actions: UiActions): () => void {
+  const toolbar = element("tools");
+  const toolButtons = new Map<Tool, HTMLButtonElement>();
+  for (const tool of ALL_TOOLS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.id = `tool-${tool}`;
+    button.title = `${TOOL_NAMES[tool]} (${TOOL_KEYS[tool].toUpperCase()})`;
+    button.setAttribute("aria-label", `${TOOL_NAMES[tool]} tool`);
+    button.setAttribute("aria-pressed", "false");
+    button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-${tool}">${TOOL_ICONS[tool]}</svg>`;
+    toolbar.append(button);
+    toolButtons.set(tool, button);
+  }
+  const duplicateButton = element<HTMLButtonElement>("duplicate");
+  const exportButton = element<HTMLButtonElement>("export");
+  const helpButton = element<HTMLButtonElement>("help-button");
+  const helpCard = element("help");
+  const emptyState = element("empty-state");
   const deleteButton = element<HTMLButtonElement>("delete");
   const swatches = [...document.querySelectorAll<HTMLButtonElement>(".swatch")];
   const statusBox = element("status");
@@ -111,9 +145,12 @@ export function mountUi(client: RoomClient, state: AppState, onDelete: () => voi
 
   // ---- controls ----------------------------------------------------------
 
-  listen(toolButtons.select, "click", () => state.setTool("select"));
-  listen(toolButtons.rectangle, "click", () => state.setTool("rectangle"));
-  listen(deleteButton, "click", onDelete);
+  for (const [tool, button] of toolButtons) listen(button, "click", () => state.setTool(tool));
+  listen(deleteButton, "click", actions.onDelete);
+  listen(duplicateButton, "click", actions.onDuplicate);
+  listen(exportButton, "click", actions.onExport);
+  listen(helpButton, "click", () => (helpCard.hidden = !helpCard.hidden));
+  listen(element("help-close"), "click", () => (helpCard.hidden = true));
   for (const swatch of swatches) {
     listen(swatch, "click", () => {
       const color = swatch.dataset.color;
@@ -136,17 +173,18 @@ export function mountUi(client: RoomClient, state: AppState, onDelete: () => voi
 
   // ---- rendering ---------------------------------------------------------
 
-  let lastShapesSignature = "";
+  let lastShapes: object | null = null;
+  let lastPreviewKey = "";
+  let lastSelectedId: string | null | undefined;
   let lastPresenceSignature = "";
 
   function renderControls(): void {
     const tool = state.getTool();
-    for (const [name, button] of Object.entries(toolButtons)) {
-      button.setAttribute("aria-pressed", String(name === tool));
-    }
+    for (const [name, button] of toolButtons) button.setAttribute("aria-pressed", String(name === tool));
     for (const swatch of swatches)
       swatch.setAttribute("aria-pressed", String(swatch.dataset.color === state.getColor()));
     deleteButton.disabled = state.getSelectedId() === null;
+    duplicateButton.disabled = state.getSelectedId() === null;
   }
 
   function renderStatus(): void {
@@ -182,34 +220,42 @@ export function mountUi(client: RoomClient, state: AppState, onDelete: () => voi
   }
 
   function renderShapeList(): void {
+    // `getLiveShapes` returns the same object until the board changes, so a
+    // cursor moving (which is most messages) costs a comparison, not a rebuild.
     const shapes = client.engine.getLiveShapes();
     const previews = client.engine.getPreviews();
     const selectedId = state.getSelectedId();
+    const previewKey = JSON.stringify(previews);
+    if (shapes === lastShapes && previewKey === lastPreviewKey && selectedId === lastSelectedId) return;
+    lastShapes = shapes;
+    lastPreviewKey = previewKey;
+    lastSelectedId = selectedId;
     const entries = Object.entries(shapes);
-    const signature = JSON.stringify([entries, previews, selectedId]);
-    if (signature === lastShapesSignature) return;
-    lastShapesSignature = signature;
 
     shapeList.replaceChildren(
       ...entries.map(([id, shape]) => {
         const item = document.createElement("li");
         item.dataset.shapeId = id;
+        item.dataset.kind = shape.kind;
         item.dataset.x = String(shape.x);
         item.dataset.y = String(shape.y);
         item.dataset.width = String(shape.width);
         item.dataset.height = String(shape.height);
         item.dataset.color = shape.color;
+        item.dataset.text = shape.text;
         if (id === selectedId) item.dataset.selected = "true";
         const preview = previewFor(id, previews);
         if (preview) {
           for (const [key, value] of Object.entries(preview))
             item.dataset[`preview${key[0]!.toUpperCase()}${key.slice(1)}`] = String(value);
         }
-        item.textContent = `Rectangle, ${shape.color}, at ${shape.x}, ${shape.y}, ${shape.width} by ${shape.height}${preview ? ", being moved by someone else" : ""}`;
+        item.textContent = describeShape(shape.kind, shape, preview !== null);
         return item;
       }),
     );
     shapeList.dataset.count = String(entries.length);
+    // The welcome card is for an empty board that is ready to draw on.
+    emptyState.hidden = entries.length > 0 || client.getStatus() !== "open";
   }
 
   let scheduled = false;

@@ -2,12 +2,33 @@ import { describe, expect, it } from "vitest";
 import { parseServerMessage } from "./parse-server-message";
 
 const hlc = { physical: 100, logical: 0, nodeId: "server" };
-const fields = { x: 1, y: 2, width: 3, height: 4, color: "#fff" };
+const fields = { x: 1, y: 2, width: 3, height: 4, color: "#fff", text: "" };
 const base = { shapeId: "s1", roomId: "r", opId: "o1", hlc };
-const shape = { ...fields, lastHlc: { x: hlc, y: hlc, width: hlc, height: hlc, color: hlc } };
+const shape = {
+  ...fields,
+  kind: "rect",
+  lastHlc: { x: hlc, y: hlc, width: hlc, height: hlc, color: hlc, text: hlc },
+};
 
 const valid: Record<string, unknown> = {
-  op_ack_create: { type: "op_ack", roomId: "r", seq: 1, op: { type: "create_shape", ...base, fields } },
+  op_ack_create: {
+    type: "op_ack",
+    roomId: "r",
+    seq: 1,
+    op: { type: "create_shape", ...base, kind: "rect", fields },
+  },
+  op_ack_update_text: {
+    type: "op_ack",
+    roomId: "r",
+    seq: 2,
+    op: { type: "update_shape", ...base, changes: { text: "hello\nworld" } },
+  },
+  op_ack_create_arrow: {
+    type: "op_ack",
+    roomId: "r",
+    seq: 1,
+    op: { type: "create_shape", ...base, kind: "arrow", fields: { ...fields, width: -30, height: -4 } },
+  },
   op_ack_update: {
     type: "op_ack",
     roomId: "r",
@@ -107,6 +128,37 @@ describe("parseServerMessage: rejects anything else", () => {
     [
       "op_ack whose update has a mistyped field",
       ...tweak("op_ack_update", (m) => ((m.op as { changes: unknown }).changes = { color: 7 })),
+    ],
+    [
+      "op_ack whose create has an unknown kind",
+      ...tweak("op_ack_create", (m) => ((m.op as { kind: unknown }).kind = "star")),
+    ],
+    [
+      "op_ack whose create has no kind",
+      ...tweak("op_ack_create", (m) => delete (m.op as { kind?: unknown }).kind),
+    ],
+    [
+      "op_ack whose create has non-string text",
+      ...tweak("op_ack_create", (m) => ((m.op as { fields: { text: unknown } }).fields.text = 5)),
+    ],
+    [
+      "op_ack whose update sets text to a number",
+      ...tweak("op_ack_update", (m) => ((m.op as { changes: unknown }).changes = { text: 5 })),
+    ],
+    [
+      "snapshot whose shape has no kind",
+      ...tweak("snapshot", (m) => delete (m.shapes as { s1: { kind?: unknown } }).s1.kind),
+    ],
+    [
+      "snapshot whose shape has an unknown kind",
+      ...tweak("snapshot", (m) => ((m.shapes as { s1: { kind: unknown } }).s1.kind = "hexagon")),
+    ],
+    [
+      "snapshot whose shape lacks the text clock",
+      ...tweak(
+        "snapshot",
+        (m) => delete (m.shapes as { s1: { lastHlc: { text?: unknown } } }).s1.lastHlc.text,
+      ),
     ],
     ["op_reject with an unknown reason", ...tweak("op_reject", (m) => (m.reason = "because"))],
     ["op_reject with no opId", ...tweak("op_reject", (m) => delete m.opId)],

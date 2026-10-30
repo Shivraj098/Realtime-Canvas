@@ -3,6 +3,8 @@ import { RoomClient } from "./room-client";
 import { CanvasView } from "./app/canvas-view";
 import { generateRoomId, roomIdFromSearch, serverUrl } from "./app/room-id";
 import { AppState } from "./app/state";
+import { deleteSelected, duplicateSelected } from "./app/actions";
+import { isTypingTarget, toolForKey } from "./app/shortcuts";
 import { mountUi } from "./app/ui";
 
 /** Colours offered for new shapes. */
@@ -30,32 +32,61 @@ function start(): void {
   const state = new AppState(DEFAULT_COLOR);
   const view = new CanvasView(canvas, client, state);
 
-  const deleteSelected = (): void => {
-    const selected = state.getSelectedId();
-    if (!selected) return;
-    client.deleteShape(selected);
-    state.setSelectedId(null);
+  const notify = (message: string): void => {
+    const notice = document.getElementById("notice");
+    if (!notice) return;
+    notice.textContent = message;
+    notice.hidden = false;
+    window.setTimeout(() => (notice.hidden = true), 3000);
   };
-  mountUi(client, state, deleteSelected);
+  const exportImage = (): void => {
+    void view.exportImage().then((saved) => {
+      if (!saved) notify("Nothing to save yet: draw something first.");
+    });
+  };
+  const duplicate = (): void => {
+    if (!duplicateSelected(client, state)) notify("Select a shape to duplicate.");
+  };
+  mountUi(client, state, {
+    onDelete: () => deleteSelected(client, state),
+    onDuplicate: duplicate,
+    onExport: exportImage,
+  });
 
   window.addEventListener("keydown", (event) => {
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (isTypingTarget(event.target as HTMLElement | null)) return;
+    const modifier = event.ctrlKey || event.metaKey;
+    if (modifier && event.key.toLowerCase() === "d") {
+      event.preventDefault(); // the browser would bookmark the page
+      duplicate();
+      return;
+    }
+    if (modifier || event.altKey) return;
+    const tool = toolForKey(event.key);
+    if (tool) {
+      state.setTool(tool);
+      return;
+    }
     switch (event.key) {
-      case "v":
-        state.setTool("select");
-        break;
-      case "r":
-        state.setTool("rectangle");
-        break;
       case "Delete":
       case "Backspace":
-        deleteSelected();
+        deleteSelected(client, state);
         event.preventDefault();
         break;
+      case "Enter":
+        view.editSelected();
+        event.preventDefault();
+        break;
+      case "?": {
+        const help = document.getElementById("help");
+        if (help) help.hidden = !help.hidden;
+        break;
+      }
       case "Escape":
         view.cancelGesture();
         state.setSelectedId(null);
         state.setTool("select");
+        document.getElementById("help")?.setAttribute("hidden", "");
         break;
     }
   });

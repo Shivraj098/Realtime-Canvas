@@ -4,7 +4,7 @@ import { SHAPE_FIELD_KEYS, type Op, type ShapeFields, type ShapeSnapshot } from 
 /**
  * Per-field Last-Write-Wins registers, ordered by Hybrid Logical Clock.
  *
- * Each *field* of a shape (x, y, width, height, color) is its own LWW
+ * Each *field* of a shape (x, y, width, height, color, text) is its own LWW
  * register with its own HLC timestamp - not the shape as a whole. That
  * distinction matters: if user A drags a shape (changing x, y) while
  * user B recolors it (changing color) at the same time, both edits
@@ -73,7 +73,7 @@ export function applyOp(state: RoomState, op: Op): RoomState {
       if (getShape(state, op.shapeId)) return state;
       const lastHlc = {} as Record<keyof ShapeFields, HlcTimestamp>;
       for (const key of SHAPE_FIELD_KEYS) lastHlc[key] = op.hlc;
-      return { ...state, [op.shapeId]: { ...op.fields, lastHlc } };
+      return { ...state, [op.shapeId]: { ...op.fields, kind: op.kind, lastHlc } };
     }
     case "update_shape": {
       const existing = getShape(state, op.shapeId);

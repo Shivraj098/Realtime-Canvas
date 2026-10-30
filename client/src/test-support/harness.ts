@@ -1,5 +1,11 @@
 import WebSocket from "ws";
-import { applyOps, type RoomState, type ShapeChanges, type ShapeFields } from "@realtime-canvas/shared";
+import {
+  applyOps,
+  type RoomState,
+  type ShapeChanges,
+  type ShapeFields,
+  type ShapeKind,
+} from "@realtime-canvas/shared";
 import { createServer, type ServerHandle, type ServerOptions } from "@realtime-canvas/server";
 import { RoomClient, type RoomClientEvent } from "../room-client";
 import type { LocalResult } from "../sync/sync-engine";
@@ -9,7 +15,7 @@ import { sleep } from "./rng";
 
 export const ROOM = "room1";
 
-export const DEFAULT_FIELDS: ShapeFields = { x: 0, y: 0, width: 20, height: 20, color: "#336699" };
+export const DEFAULT_FIELDS: ShapeFields = { x: 0, y: 0, width: 20, height: 20, color: "#336699", text: "" };
 
 /** One client wired to the real server through its own fault-injecting network. */
 export class TestClient {
@@ -29,8 +35,8 @@ export class TestClient {
     return this.client.engine;
   }
 
-  create(fields: Partial<ShapeFields> = {}, shapeId?: string): LocalResult {
-    return this.track(this.client.createShape({ ...DEFAULT_FIELDS, ...fields }, shapeId));
+  create(fields: Partial<ShapeFields> = {}, shapeId?: string, kind: ShapeKind = "rect"): LocalResult {
+    return this.track(this.client.createShape(kind, { ...DEFAULT_FIELDS, ...fields }, shapeId));
   }
 
   update(shapeId: string, changes: ShapeChanges): LocalResult {

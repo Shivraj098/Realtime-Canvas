@@ -8,6 +8,8 @@ const FALLBACK: Theme = {
   labelText: "#ffffff",
   shadow: "rgba(0, 0, 0, 0.25)",
   font: "600 11px system-ui, sans-serif",
+  shapeInk: "#1f2430",
+  textShade: -0.4,
 };
 
 /** Reads the canvas colours from the page's CSS variables, so the canvas follows light and dark mode. */
@@ -22,5 +24,7 @@ export function readTheme(element: Element = document.documentElement): Theme {
     labelText: read("--label-text", FALLBACK.labelText),
     shadow: read("--canvas-shadow", FALLBACK.shadow),
     font: read("--canvas-font", FALLBACK.font),
+    shapeInk: read("--shape-ink", FALLBACK.shapeInk),
+    textShade: Number.parseFloat(read("--text-shade", String(FALLBACK.textShade))) || 0,
   };
 }

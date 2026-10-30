@@ -13,6 +13,7 @@ import {
   CLOSE_TRY_AGAIN_LATER,
   CLOSE_UNSUPPORTED_PROTOCOL,
   HlcDriftError,
+  geometryProblem,
   HybridLogicalClock,
   PROTOCOL_VERSION,
   type ClientMessage,
@@ -175,7 +176,11 @@ export function createServer(opts: ServerOptions): ServerHandle {
   /** Why an op that is not a retry cannot be applied, or null if it can. */
   function semanticRejection(room: Room, op: Op): OpRejectReason | null {
     if (op.type === "create_shape") return room.hasShape(op.shapeId) ? "shape_exists" : null;
-    return room.isLive(op.shapeId) ? null : "unknown_shape";
+    const kind = room.liveKind(op.shapeId);
+    if (kind === undefined) return "unknown_shape";
+    // Only a line or arrow may have a negative size; the schema cannot know the kind of an existing shape.
+    if (op.type === "update_shape" && geometryProblem(kind, op.changes) !== null) return "invalid";
+    return null;
   }
 
   /** Why a valid, new op must still be refused because a ceiling has been reached, or null. */
@@ -412,7 +417,8 @@ export function createServer(opts: ServerOptions): ServerHandle {
       // for a shape that does not exist (or is deleted) is dropped quietly:
       // it is high-frequency, short-lived, and an error per frame would
       // only add noise.
-      if (!session.room.isLive(message.shapeId)) return;
+      const kind = session.room.liveKind(message.shapeId);
+      if (kind === undefined || geometryProblem(kind, message.changes) !== null) return;
       const outgoing: DragPreview = { ...message, roomId: session.room.id, clientId: session.clientId };
       session.room.broadcast(JSON.stringify(outgoing satisfies ServerMessage), socket);
     }

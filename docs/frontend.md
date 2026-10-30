@@ -11,14 +11,18 @@ The rule is that **decisions are pure and testable; the browser glue is thin.**
 
 | Module        | Kind     | Job                                                                                                 |
 | ------------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `geometry`    | pure     | Rectangles, hit-testing, resize maths (clamped, never flips), rounding to what the server accepts.  |
+| `geometry`    | pure     | Hit-testing per shape kind, boxes vs line vectors, resize maths, Shift constraints, rounding.       |
+| `text-layout` | pure     | Word wrap, where a label may sit inside each shape, text-box height. Width of text is passed in.    |
+| `shortcuts`   | pure     | Which key is which tool, when to ignore keys (typing), what a duplicate looks like.                 |
+| `appear`      | pure     | Which shapes just arrived, so only they pop in (not the whole board when you join).                 |
 | `interaction` | pure     | The pointer state machine: press, drag, release become _effects_ (select, preview, create, update). |
 | `scene`       | pure     | Engine state + the local gesture become "what to draw": drag overrides, remote previews, cursors.   |
 | `render`      | pure-ish | Draws a scene to a 2D context. Takes a context, so it is tested with a recording fake.              |
 | `smoothing`   | pure     | Makes remote cursors glide instead of jump (frame-rate independent).                                |
 | `throttle`    | pure     | Leading + trailing throttle, so a drag always ends where the pointer stopped.                       |
 | `canvas-view` | glue     | Canvas sizing, pointer events, the draw loop. Covered by the browser tests.                         |
-| `ui`, `main`  | glue     | Toolbar, status, presence, keyboard shortcuts, room from the URL.                                   |
+| `text-editor` | glue     | The `<textarea>` laid over the canvas for typing; reports once on Enter, Escape or click-away.      |
+| `ui`, `main`  | glue     | Toolbar, status, presence, help card, keyboard shortcuts, room from the URL. Smoke-tested in jsdom. |
 
 ## One gesture, one op
 
@@ -31,9 +35,26 @@ became an op, the log would fill with positions nobody needs. Instead:
 2. **On release**, ONE `update_shape` carries the final geometry (only the
    fields that changed). When its ack arrives, previews of that shape are dropped.
 
-Drawing a rectangle works the same way: the outline is local while you drag, and
-one `create_shape` is sent on release. A click without a drag makes a default
-120×80 rectangle.
+Drawing works the same way for every shape: the outline is local while you drag,
+and one `create_shape` is sent on release. A click without a drag makes a default
+120×80 box, or a 120-pixel horizontal line or arrow.
+
+## Shapes, arrows and text
+
+Seven kinds: rectangle, ellipse, diamond, triangle, line, arrow and text.
+
+- A closed shape is hit-tested by its outline (the empty corner of an ellipse
+  passes clicks to what is behind it); a line is hit within 8 px of its stroke.
+- A selected box has four corner handles; a selected line or arrow has one handle
+  at each end, and dragging an end past the other flips it. Shift snaps a line to
+  45°, makes a drawn box square, and locks a dragged shape to one axis.
+- **Text**: double-click a shape to label it, double-click empty canvas (or use the
+  text tool) to write, press Enter on a selected shape to edit. Enter finishes,
+  Shift+Enter adds a line, Escape discards. A new text shape is created only when
+  you finish typing, so an abandoned one leaves nothing in the log; clearing an
+  existing text shape deletes it.
+- Also: duplicate (Ctrl/Cmd+D), save the board as a PNG, a shortcuts card (`?`),
+  and shapes that pop in when someone else adds them.
 
 ## Smooth remote cursors
 
@@ -95,7 +116,8 @@ workflow so the fast checks are not held up by browsers.
 
 - **No pan or zoom.** World coordinates are screen pixels, so people with
   different window sizes see the same coordinates in different places.
-- **Rectangles only**, and stacking order is creation order (no "bring to front").
+- Stacking order is creation order (no "bring to front"). Lines have no labels, and text has one size and no formatting.
+- Text height is measured in the browser when typing finishes, so two browsers with different fonts may draw the same text a little differently.
 - **No undo.** Deleting is final (the shape stays as a tombstone in the log).
 - **Touch** works through pointer events (and `touch-action: none`) but has only
   been exercised through the browser's pointer API, not on a physical device.

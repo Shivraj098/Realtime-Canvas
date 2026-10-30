@@ -1,10 +1,12 @@
 import {
   SHAPE_FIELD_KEYS,
+  SHAPE_KINDS,
   type ErrorCode,
   type HlcTimestamp,
   type Op,
   type OpRejectReason,
   type ServerMessage,
+  type ShapeKind,
   type ShapeSnapshot,
 } from "@realtime-canvas/shared";
 
@@ -37,8 +39,10 @@ function isHlc(value: unknown): value is HlcTimestamp {
 }
 
 function fieldHasRightType(key: (typeof SHAPE_FIELD_KEYS)[number], value: unknown): boolean {
-  return key === "color" ? isString(value) : isNumber(value);
+  return key === "color" || key === "text" ? isString(value) : isNumber(value);
 }
+
+const isKind = (value: unknown): value is ShapeKind => SHAPE_KINDS.includes(value as ShapeKind);
 
 function isShapeFields(value: unknown): boolean {
   return isRecord(value) && SHAPE_FIELD_KEYS.every((key) => fieldHasRightType(key, value[key]));
@@ -64,7 +68,7 @@ function isOp(value: unknown): value is Op {
   }
   switch (value.type) {
     case "create_shape":
-      return isShapeFields(value.fields);
+      return isKind(value.kind) && isShapeFields(value.fields);
     case "update_shape":
       return isChanges(value.changes, SHAPE_FIELD_KEYS);
     case "delete_shape":
@@ -77,6 +81,7 @@ function isOp(value: unknown): value is Op {
 function isShapeSnapshot(value: unknown): value is ShapeSnapshot {
   if (!isShapeFields(value)) return false;
   const shape = value as Rec;
+  if (!isKind(shape.kind)) return false;
   if (!isRecord(shape.lastHlc) || !SHAPE_FIELD_KEYS.every((key) => isHlc((shape.lastHlc as Rec)[key])))
     return false;
   return shape.deletedAt === undefined || isHlc(shape.deletedAt);

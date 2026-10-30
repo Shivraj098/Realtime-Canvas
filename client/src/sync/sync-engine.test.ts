@@ -10,7 +10,7 @@ import {
 import { SyncEngine, type SyncEngineOptions } from "./sync-engine";
 
 const ROOM = "room1";
-const FIELDS: ShapeFields = { x: 0, y: 0, width: 10, height: 10, color: "#000000" };
+const FIELDS: ShapeFields = { x: 0, y: 0, width: 10, height: 10, color: "#000000", text: "" };
 
 const serverHlc = (physical: number, logical = 0): HlcTimestamp => ({ physical, logical, nodeId: "server" });
 
@@ -33,6 +33,7 @@ function stamped(op: Op, physical: number, logical = 0): Op {
 
 const remoteCreate = (shapeId: string, physical: number, fields: ShapeFields = FIELDS): Op => ({
   type: "create_shape",
+  kind: "rect",
   shapeId,
   roomId: ROOM,
   fields,
@@ -60,13 +61,14 @@ function snapshotShape(fields: ShapeFields, physical: number, deletedAt?: HlcTim
   const at = serverHlc(physical);
   return {
     ...fields,
-    lastHlc: { x: at, y: at, width: at, height: at, color: at },
+    kind: "rect",
+    lastHlc: { x: at, y: at, width: at, height: at, color: at, text: at },
     ...(deletedAt && { deletedAt }),
   };
 }
 
 function created(engine: SyncEngine, shapeId = "s1"): Op {
-  const result = engine.createShape(FIELDS, shapeId);
+  const result = engine.createShape("rect", FIELDS, shapeId);
   if (!result.ok) throw new Error(`create failed: ${result.reason}`);
   return result.op;
 }
@@ -172,9 +174,9 @@ describe("refusing edits that cannot work", () => {
   it("refuses to create a shape id it already has, and to touch a deleted one", () => {
     const { engine } = makeEngine();
     created(engine);
-    expect(engine.createShape(FIELDS, "s1")).toEqual({ ok: false, reason: "shape_exists" });
+    expect(engine.createShape("rect", FIELDS, "s1")).toEqual({ ok: false, reason: "shape_exists" });
     engine.deleteShape("s1");
-    expect(engine.createShape(FIELDS, "s1")).toEqual({ ok: false, reason: "shape_exists" });
+    expect(engine.createShape("rect", FIELDS, "s1")).toEqual({ ok: false, reason: "shape_exists" });
     expect(engine.updateShape("s1", { x: 1 })).toEqual({ ok: false, reason: "unknown_shape" });
   });
 
@@ -182,12 +184,12 @@ describe("refusing edits that cannot work", () => {
     const { engine } = makeEngine({ maxPending: 2 });
     const first = created(engine, "a");
     created(engine, "b");
-    expect(engine.createShape(FIELDS, "c")).toEqual({ ok: false, reason: "queue_full" });
+    expect(engine.createShape("rect", FIELDS, "c")).toEqual({ ok: false, reason: "queue_full" });
     expect(engine.updateShape("a", { x: 1 })).toEqual({ ok: false, reason: "queue_full" });
     expect(engine.deleteShape("a")).toEqual({ ok: false, reason: "queue_full" });
 
     engine.receive(ack(1, stamped(first, 200)));
-    expect(engine.createShape(FIELDS, "c").ok).toBe(true);
+    expect(engine.createShape("rect", FIELDS, "c").ok).toBe(true);
   });
 });
 
@@ -570,5 +572,53 @@ describe("subscriptions", () => {
     engine.subscribe(listener);
     engine.onDisconnected();
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("shape kinds and text", () => {
+  it("creates a shape of the kind asked for and sends it in the op", () => {
+    const { engine } = makeEngine();
+    const result = engine.createShape("ellipse", { ...FIELDS, text: "hi" }, "e1");
+    expect(result.ok && result.op).toMatchObject({
+      type: "create_shape",
+      kind: "ellipse",
+      fields: { text: "hi" },
+    });
+    expect(engine.getView().e1).toMatchObject({ kind: "ellipse", text: "hi" });
+  });
+
+  it("lets a line or arrow point up and to the left", () => {
+    const { engine } = makeEngine();
+    expect(engine.createShape("arrow", { ...FIELDS, width: -50, height: -20 }, "a1").ok).toBe(true);
+    expect(engine.updateShape("a1", { width: -5 }).ok).toBe(true);
+  });
+
+  it("refuses a box with a negative size, on create and on update, before anything is queued", () => {
+    const { engine } = makeEngine();
+    expect(engine.createShape("rect", { ...FIELDS, width: -1 }, "r1")).toEqual({
+      ok: false,
+      reason: "invalid_geometry",
+    });
+    engine.createShape("text", FIELDS, "t1");
+    expect(engine.updateShape("t1", { height: -1 })).toEqual({ ok: false, reason: "invalid_geometry" });
+    expect(engine.getPending()).toHaveLength(1);
+  });
+
+  it("changes a label with an ordinary update, keeping the other fields", () => {
+    const { engine } = makeEngine();
+    engine.createShape("diamond", FIELDS, "d1");
+    expect(engine.updateShape("d1", { text: "yes" }).ok).toBe(true);
+    expect(engine.getView().d1).toMatchObject({ kind: "diamond", text: "yes", color: "#000000" });
+  });
+
+  it("builds a snapshot from the server with kinds and text intact", () => {
+    const { engine } = makeEngine();
+    engine.receive({
+      type: "sync_snapshot",
+      roomId: ROOM,
+      latestSeq: 1,
+      shapes: { s1: { ...snapshotShape(FIELDS, 5), kind: "triangle", text: "tri" } },
+    });
+    expect(engine.getLiveShapes().s1).toMatchObject({ kind: "triangle", text: "tri" });
   });
 });

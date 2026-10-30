@@ -1,4 +1,10 @@
-import type { GeometryChanges, OpRejectReason, ShapeChanges, ShapeFields } from "@realtime-canvas/shared";
+import type {
+  GeometryChanges,
+  OpRejectReason,
+  ShapeChanges,
+  ShapeFields,
+  ShapeKind,
+} from "@realtime-canvas/shared";
 import { RoomSocket, type BackoffOptions, type SocketStatus } from "./net/room-socket";
 import {
   globalWebSocketConstructor,
@@ -156,8 +162,8 @@ export class RoomClient {
 
   // ---- edits: applied locally at once, sent now if online, otherwise when the connection returns
 
-  createShape(fields: ShapeFields, shapeId?: string): LocalResult {
-    return this.send(this.engine.createShape(fields, shapeId));
+  createShape(kind: ShapeKind, fields: ShapeFields, shapeId?: string): LocalResult {
+    return this.send(this.engine.createShape(kind, fields, shapeId));
   }
 
   updateShape(shapeId: string, changes: ShapeChanges): LocalResult {

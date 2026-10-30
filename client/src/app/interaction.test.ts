@@ -21,12 +21,12 @@ const other: Rect = { x: 500, y: 500, width: 50, height: 50 };
 const select = (selectedId: string | null = null): InteractionContext => ({
   tool: "select",
   shapes: [
-    { id: "box", rect: box },
-    { id: "other", rect: other },
+    { id: "box", kind: "rect", rect: box },
+    { id: "other", kind: "rect", rect: other },
   ],
   selectedId,
 });
-const rectangleTool: InteractionContext = { tool: "rectangle", shapes: [], selectedId: null };
+const rectangleTool: InteractionContext = { tool: "rect", shapes: [], selectedId: null };
 
 /** Runs a whole gesture and returns every effect, in order. */
 function gesture(
@@ -217,7 +217,7 @@ describe("creating", () => {
       { x: 420, y: 380 },
     ]);
     expect(effects.filter((e) => e.type === "create")).toEqual([
-      { type: "create", rect: { x: 300, y: 300, width: 120, height: 80 } },
+      { type: "create", shape: "rect", rect: { x: 300, y: 300, width: 120, height: 80 } },
     ]);
   });
 
@@ -228,6 +228,7 @@ describe("creating", () => {
     ]);
     expect(effects.find((e) => e.type === "create")).toEqual({
       type: "create",
+      shape: "rect",
       rect: { x: 300, y: 300, width: 120, height: 80 },
     });
   });
@@ -239,6 +240,7 @@ describe("creating", () => {
     ]);
     expect(effects.find((e) => e.type === "create")).toEqual({
       type: "create",
+      shape: "rect",
       rect: { x: 400 - DEFAULT_SIZE.width / 2, y: 300 - DEFAULT_SIZE.height / 2, ...DEFAULT_SIZE },
     });
   });
@@ -256,7 +258,10 @@ describe("creating", () => {
     const down = pointerDown(IDLE, rectangleTool, { x: 10, y: 10 });
     expect(down.effects).toEqual([{ type: "select", shapeId: null }]);
     const moved = pointerMove(down.state, { x: 60, y: 50 });
-    expect(creationGhost(moved.state)).toEqual({ x: 10, y: 10, width: 50, height: 40 });
+    expect(creationGhost(moved.state)).toEqual({
+      kind: "rect",
+      rect: { x: 10, y: 10, width: 50, height: 40 },
+    });
     expect(moved.effects).toEqual([]); // nothing is previewed: the shape does not exist yet
   });
 });

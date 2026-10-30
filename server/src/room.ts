@@ -1,5 +1,12 @@
 import type { WebSocket } from "ws";
-import { applyOp, getShape, isDeleted, type Op, type RoomState } from "@realtime-canvas/shared";
+import {
+  applyOp,
+  getShape,
+  isDeleted,
+  type Op,
+  type RoomState,
+  type ShapeKind,
+} from "@realtime-canvas/shared";
 import type { Logger } from "./app";
 import type { StoredOp, StoredSnapshot } from "./op-log";
 
@@ -102,6 +109,12 @@ export class Room {
   isLive(shapeId: string): boolean {
     const shape = getShape(this.currentState, shapeId);
     return shape !== undefined && !isDeleted(shape);
+  }
+
+  /** The kind of a live shape, or undefined if there is no such live shape. */
+  liveKind(shapeId: string): ShapeKind | undefined {
+    const shape = getShape(this.currentState, shapeId);
+    return shape !== undefined && !isDeleted(shape) ? shape.kind : undefined;
   }
 
   addClient(clientId: string, socket: WebSocket): Client {

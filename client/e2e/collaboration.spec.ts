@@ -56,6 +56,92 @@ async function controllableNetwork(page: Page) {
   };
 }
 
+/** Drags out a shape with the tool the key chooses. */
+async function drawWith(
+  page: Page,
+  key: string,
+  from: [number, number],
+  to: [number, number],
+): Promise<void> {
+  await page.keyboard.press(key);
+  await page.mouse.move(...from);
+  await page.mouse.down();
+  await page.mouse.move(...to, { steps: 8 });
+  await page.mouse.up();
+}
+
+test("an arrow that points up and left, and a labelled ellipse, reach another browser", async ({
+  browser,
+}) => {
+  const room = uniqueRoom();
+  const alice = await openBoard(await browser.newContext(), room);
+  const bob = await openBoard(await browser.newContext(), room);
+
+  await drawWith(alice, "a", [400, 300], [300, 250]);
+  await expect(bob.locator("#shape-list li[data-kind=arrow]")).toHaveAttribute("data-width", "-100");
+  await expect(bob.locator("#shape-list li[data-kind=arrow]")).toHaveAttribute("data-height", "-50");
+
+  await drawWith(alice, "o", [500, 400], [620, 480]);
+  await alice.mouse.dblclick(560, 440);
+  await expect(alice.locator(".text-editor")).toBeVisible();
+  await alice.keyboard.type("Hello");
+  await alice.keyboard.press("Enter");
+
+  await expect(bob.locator("#shape-list li[data-kind=ellipse]")).toHaveAttribute("data-text", "Hello");
+  await expect(alice.locator(".text-editor")).toBeHidden();
+});
+
+test("double-clicking empty canvas types a new text shape that the other browser sees", async ({
+  browser,
+}) => {
+  const room = uniqueRoom();
+  const alice = await openBoard(await browser.newContext(), room);
+  const bob = await openBoard(await browser.newContext(), room);
+
+  await alice.mouse.dblclick(300, 300);
+  await expect(alice.locator(".text-editor")).toBeVisible();
+  await alice.keyboard.type("note to self");
+  await alice.keyboard.press("Enter");
+
+  await expect(bob.locator("#shape-list li[data-kind=text]")).toHaveAttribute("data-text", "note to self");
+  // Escape throws typing away: nothing is created.
+  await alice.mouse.dblclick(700, 500);
+  await expect(alice.locator(".text-editor")).toBeVisible();
+  await alice.keyboard.type("never mind");
+  await alice.keyboard.press("Escape");
+  await expect(shapeItems(bob)).toHaveCount(1);
+});
+
+test("typing the letters of a shortcut into a label does not change tools or delete the shape", async ({
+  page,
+}) => {
+  await page.goto(`/?room=${uniqueRoom()}`);
+  await expect(status(page)).toHaveAttribute("data-status", "open");
+  await drawWith(page, "r", [300, 300], [420, 380]);
+  await page.mouse.dblclick(360, 340);
+  await expect(page.locator(".text-editor")).toBeVisible();
+  await page.keyboard.type("rod a lot");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.press("Enter");
+  await expect(shapeItems(page)).toHaveCount(1);
+  await expect(shapeItems(page).first()).toHaveAttribute("data-text", "rod a lo");
+});
+
+test("duplicate copies the selected shape, and the help card opens with ?", async ({ page }) => {
+  await page.goto(`/?room=${uniqueRoom()}`);
+  await expect(status(page)).toHaveAttribute("data-status", "open");
+  await drawWith(page, "d", [300, 300], [420, 380]);
+  await page.keyboard.press("Control+d");
+  await expect(shapeItems(page)).toHaveCount(2);
+  await expect(shapeItems(page).nth(1)).toHaveAttribute("data-kind", "diamond");
+  await expect(shapeItems(page).nth(1)).toHaveAttribute("data-x", "324");
+
+  await page.keyboard.press("?");
+  await expect(page.locator("#help")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#help")).toBeHidden();
+});
+
 test("opening the app without a room creates a private one and keeps it across a reload", async ({
   page,
 }) => {

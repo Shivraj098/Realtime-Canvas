@@ -352,7 +352,34 @@ describe("property: any mix of edits and network failures converges", () => {
   const color = fc.constantFrom("#111111", "#222222", "#333333", "#444444");
 
   const action = fc.oneof(
-    { weight: 4, arbitrary: fc.record({ kind: fc.constant("create" as const), who: fc.nat(2), color }) },
+    {
+      weight: 4,
+      arbitrary: fc.record({
+        kind: fc.constant("create" as const),
+        who: fc.nat(2),
+        color,
+        shape: fc.constantFrom("rect", "ellipse", "diamond", "triangle", "line", "arrow", "text"),
+      }),
+    },
+    {
+      weight: 3,
+      arbitrary: fc.record({
+        kind: fc.constant("relabel" as const),
+        who: fc.nat(2),
+        target: fc.nat(),
+        text: fc.constantFrom("", "a", "two words", "line\nbreak"),
+      }),
+    },
+    {
+      weight: 2,
+      arbitrary: fc.record({
+        kind: fc.constant("flip" as const),
+        who: fc.nat(2),
+        target: fc.nat(),
+        width: fc.integer({ min: -300, max: 300 }),
+        height: fc.integer({ min: -300, max: 300 }),
+      }),
+    },
     {
       weight: 5,
       arbitrary: fc.record({
@@ -436,8 +463,19 @@ describe("property: any mix of edits and network failures converges", () => {
               const c = clients[step.who]!;
               switch (step.kind) {
                 case "create":
-                  c.create({ color: step.color });
+                  c.create({ color: step.color }, undefined, step.shape);
                   break;
+                case "relabel": {
+                  const id = pick(c, step.target);
+                  if (id) c.update(id, { text: step.text });
+                  break;
+                }
+                case "flip": {
+                  // Only lines may point backwards; for a box the client refuses it, which is part of the test.
+                  const id = pick(c, step.target);
+                  if (id) c.update(id, { width: step.width, height: step.height });
+                  break;
+                }
                 case "move": {
                   const id = pick(c, step.target);
                   if (id) c.update(id, { x: step.x, y: step.y });

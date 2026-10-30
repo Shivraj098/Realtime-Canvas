@@ -1,0 +1,13 @@
+**/node_modules
+**/dist
+.git
+.github
+data
+*.sqlite*
+*.zip
+docs
+client
+!client/package.json
+**/test-results
+**/playwright-report
+.env*

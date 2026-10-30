@@ -28,6 +28,11 @@ See [`shared/src/hlc.ts`](shared/src/hlc.ts) and
 conflict-resolution logic, with test coverage in the adjacent
 `*.test.ts` files.
 
+## Documentation
+
+[Wire protocol](docs/protocol.md) · [Client core](docs/client.md) ·
+[Canvas UI](docs/frontend.md) · [Server hardening](docs/hardening.md)
+
 ## Status
 
 Built in phases, each with its own tested, committed, CI-passing
@@ -39,8 +44,9 @@ checkpoint.
 - [x] **Phase 2 — Server**: WebSocket server, room management, SQLite op
       log, reconnect/replay
 - [x] **Phase 3 — Client core**: connection handling, local state store
-- [x] **Phase 4 — Client canvas**: shape rendering, drag/create/delete,
-      live cursors
+- [x] **Phase 4 — Client canvas**: seven shape kinds (rectangle, ellipse,
+      diamond, triangle, line, arrow, text), labels, drag/resize/delete,
+      duplicate, PNG export, live cursors
 - [x] **Phase 5a — Hardening**: health check, heartbeat, origin allowlist,
       rate limits, capacity caps, idle-room eviction and snapshots
 - [ ] **Phase 5b — Deployment**: Dockerized server on Fly.io, static

@@ -12,7 +12,8 @@ function createOp(shapeId: string, at: HlcTimestamp): Op {
     type: "create_shape",
     shapeId,
     roomId: "room1",
-    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000" },
+    kind: "rect",
+    fields: { x: 0, y: 0, width: 10, height: 10, color: "#000", text: "" },
     hlc: at,
     opId: `create-${shapeId}`,
   };
@@ -49,6 +50,19 @@ describe("applyOp: create_shape", () => {
     expect(state.s1).toBeDefined();
     expect(state.s1!.x).toBe(0);
     expect(state.s1!.lastHlc.color).toEqual(hlc(100));
+  });
+
+  it("keeps the kind the shape was created with, and starts it with its text", () => {
+    const op: Op = {
+      ...(createOp("s1", hlc(100)) as Extract<Op, { type: "create_shape" }>),
+      kind: "arrow",
+      fields: { x: 5, y: 5, width: -40, height: 12, color: "#000", text: "go" },
+    };
+    const shape = applyOp({}, op).s1!;
+    expect(shape.kind).toBe("arrow");
+    expect(shape.width).toBe(-40);
+    expect(shape.text).toBe("go");
+    expect(shape.lastHlc.text).toEqual(hlc(100));
   });
 
   it("is a no-op when the shapeId already exists (duplicate/replayed create)", () => {
@@ -263,5 +277,29 @@ describe("convergence: the actual CRDT property", () => {
     const deleteFirst = applyOps({}, [create, del, update]);
     expect(liveShapes(updateFirst)).toEqual({});
     expect(liveShapes(deleteFirst)).toEqual({});
+  });
+});
+
+describe("applyOp: text and kind", () => {
+  it("resolves text as its own register: a concurrent recolor and relabel both survive", () => {
+    const base = applyOp({}, createOp("s1", hlc(100)));
+    const a = applyOp(base, updateManyOp("s1", { text: "hello" }, hlc(200, 0, "a")));
+    const b = applyOp(a, updateManyOp("s1", { color: "#f00" }, hlc(150, 0, "b")));
+    expect(b.s1).toMatchObject({ text: "hello", color: "#f00" });
+  });
+
+  it("lets the later of two same-field text edits win, in either delivery order", () => {
+    const base = applyOp({}, createOp("s1", hlc(100)));
+    const early = updateManyOp("s1", { text: "early" }, hlc(200, 0, "a"));
+    const late = updateManyOp("s1", { text: "late" }, hlc(200, 1, "b"));
+    expect(applyOps(base, [early, late]).s1!.text).toBe("late");
+    expect(applyOps(base, [late, early]).s1!.text).toBe("late");
+  });
+
+  it("never changes a shape's kind through an update", () => {
+    const base = applyOp({}, createOp("s1", hlc(100)));
+    const sneaky = updateManyOp("s1", { kind: "arrow" } as unknown as ShapeChanges, hlc(200));
+    expect(applyOp(base, sneaky)).toBe(base);
+    expect(applyOp(base, sneaky).s1!.kind).toBe("rect");
   });
 });
